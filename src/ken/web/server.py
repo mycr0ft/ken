@@ -166,6 +166,21 @@ def api_search(con, params):
         return {"items": items, "total": total, "q": text, "in": scope}
 
     items = {}
+    if scope == "docs":
+        # Prose search: what the author wrote about a thing, not what it is called.
+        match = '"' + re_sub(text) + '"*'
+        try:
+            items = [dict(r) for r in con.execute("""
+                SELECT e.id, e.kind, e.name, e.qualname, e.line, e.decl,
+                       f.id file_id, f.path, bm25(doc_fts) rank,
+                       snippet(doc_fts, 0, '\x01', '\x02', ' … ', 16) excerpt
+                FROM doc_fts JOIN entities e ON e.id = doc_fts.rowid
+                JOIN files f ON f.id = e.file_id
+                WHERE doc_fts MATCH ? ORDER BY rank LIMIT ?""", (match, limit))]
+        except sqlite3.OperationalError:
+            items = []
+        return {"items": items, "total": len(items), "q": text, "in": scope}
+
     # FTS for the token search, LIKE for substrings FTS cannot prefix-match
     match = '"' + re_sub(text) + '"*'
     try:
@@ -255,8 +270,23 @@ def api_symbol(con, params):
         WHERE r.target_id = ? AND r.kind = 'inherit' ORDER BY s.qualname""", (eid,))
     ref_kinds = _rows(con, "SELECT kind, COUNT(*) n FROM refs WHERE src_entity = ? GROUP BY kind",
                       (eid,))
+    doc_seen = _rows(con, """
+        SELECT d.target, d.target_id, t.qualname target_qual, t.kind target_kind,
+               t.line target_line, f.id file_id, f.path target_path
+        FROM doc_links d
+        LEFT JOIN entities t ON t.id = d.target_id
+        LEFT JOIN files f ON f.id = t.file_id
+        WHERE d.src_entity = ? ORDER BY (d.target_id IS NULL), d.target""", (eid,))
+    documented_in_docs = _rows(con, """
+        SELECT d.src_entity, s.qualname src_qual, s.kind src_kind,
+               f.id file_id, f.path
+        FROM doc_links d
+        JOIN entities s ON s.id = d.src_entity
+        JOIN files f ON f.id = s.file_id
+        WHERE d.target_id = ? ORDER BY s.qualname LIMIT 100""", (eid,))
     return {"entity": ent, "parents": list(reversed(chain)), "children": children,
             "out": out_refs, "callers": callers, "subclasses": subclasses,
+            "doc_seen": doc_seen, "documented_in": documented_in_docs,
             "ref_kinds": ref_kinds}
 
 

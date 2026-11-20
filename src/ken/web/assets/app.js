@@ -395,6 +395,54 @@ async function viewFile(host, params, id) {
     '<p class="dim" style="font-size:11.5px">Nothing depends on this file.</p>';
 }
 
+// Doxygen, Javadoc, GoDoc and JSDoc all reduce to the same thing: prose, plus a
+// handful of tag lines. Render the prose as prose and the tags as a definition
+// list, so a @param reads as a parameter rather than as a paragraph that
+// happens to start with an at-sign.
+const DOC_LEAD = new Set(['brief', 'short', 'details', 'file', 'mainpage', 'summary']);
+const DOC_STYLE = { c: 'Doxygen', cpp: 'Doxygen', java: 'Javadoc', go: 'GoDoc',
+                    js: 'JSDoc', ts: 'JSDoc', rust: 'rustdoc', py: 'docstring' };
+
+function docHtml(doc) {
+  // Javadoc allows a small HTML dialect; Doxygen, JSDoc and GoDoc do not. Keep
+  // the block-level bits that carry meaning (paragraphs, breaks, preformatted
+  // examples) and drop the rest, so a reader never sees a literal <p> in prose.
+  const pre = [];
+  let s = doc.replace(/\{@(?:link|linkplain|code|literal)\s+([^}]+)\}/g, '$1')
+    .replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, body) => {
+      pre.push(body.replace(/^\n+|\n+$/g, ''));
+      return `\u0000PRE${pre.length - 1}\u0000`;
+    })
+    .replace(/<\/?(?:p|li|ul|ol|dl)\b[^>]*>/gi, '\n\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(?:code|tt|b|i|em|strong|a|dt|dd|h[1-6])\b[^>]*>/gi, '');
+
+  const prose = [], tags = [];
+  for (const raw of s.split('\n')) {
+    const line = raw.trim();
+    if (!line) { if (!tags.length) prose.push(''); continue; }
+    const m = line.match(/^[@\\]([A-Za-z]+)(\[[^\]]*\])?\s*(.*)$/);
+    if (m && !DOC_LEAD.has(m[1].toLowerCase())) {
+      tags.push([m[1] + (m[2] || ''), m[3]]);
+    } else if (m) {
+      prose.push(m[3]);
+    } else if (tags.length && raw.startsWith(' ')) {
+      // a wrapped tag argument keeps the indentation its author gave it
+      tags[tags.length - 1][1] += ' ' + line;
+    } else {
+      prose.push(line);
+    }
+  }
+  const body = prose.join('\n').trim().split(/\n\s*\n/).filter(Boolean).map((p) => {
+    const only = p.trim().match(/^\u0000PRE(\d+)\u0000$/);
+    if (only) return `<pre class="docpre">${esc(pre[+only[1]])}</pre>`;
+    return `<p>${esc(p.replace(/\s*\n\s*/g, ' '))}</p>`;
+  }).join('');
+  const list = tags.length ? `<dl class="doctags">${tags.map(([t, v]) =>
+    `<dt class="mono">${esc(t)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>` : '';
+  return body + list;
+}
+
 async function viewSymbol(host, params, id) {
   const d = await overview();
   const s = await api('/api/symbol', { id });
@@ -410,7 +458,9 @@ async function viewSymbol(host, params, id) {
       <div class="id">
         <div class="crumb">${s.parents.map((p) => `<a href="#/sym/${p.id}">${esc(p.qualname)}</a>`).join(' <span class="dim">›</span> ')}
           ${s.parents.length ? '<span class="dim">›</span> ' : ''}<span>${esc(e.name)}</span></div>
-        <h1>${esc(e.qualname)} ${kindTag(e.kind)} ${e.decl ? '<span class="badge">decl</span>' : ''}</h1>
+        <h1>${esc(e.qualname)} ${kindTag(e.kind)} ${e.decl ? '<span class="badge">decl</span>' : ''}${
+          /[@\\]deprecated|^\s*deprecated\b|\bdeprecated:/im.test(e.doc || '')
+            ? ' <span class="badge warn">deprecated</span>' : ''}</h1>
         <div class="loc">
           <span><a class="link" href="#/file/${e.file_id}?line=${e.line}">${esc(shortPath(e.path, d.root))}:${e.line}</a></span>
           <span>lines <b>${e.end_line - e.line + 1}</b></span>
@@ -427,6 +477,11 @@ async function viewSymbol(host, params, id) {
     <div class="rule"></div>
     <div class="symgrid">
       <div>
+        ${e.doc ? `<section class="docblock">
+          <div class="docmeta"><span>Documentation</span>
+            <span class="mono dim">${esc(DOC_STYLE[e.lang] || 'comments')}</span></div>
+          ${docHtml(e.doc)}
+        </section>` : ''}
         <div data-code></div>
 
         ${others.length ? `<section class="sec">
@@ -497,6 +552,24 @@ async function viewSymbol(host, params, id) {
             <span class="k">${c.kind === 'method' ? 'ƒ' : '·'}</span>
             <span>${hash(c.id, c.name)}</span><span class="c">${c.line}</span></div>`).join('')}</div>
         </section>` : ''}
+        ${s.doc_seen.length ? `<section>
+          <h2>Documentation links<span class="c mono">${s.doc_seen.length}</span></h2>
+          <div class="list">${s.doc_seen.map((r) => {
+            const inner = `<span class="t">${esc(r.target_qual ? leafName(r.target_qual) : r.target)}</span>
+              <span class="s">${esc(r.target_id ? 'resolved' : 'not in this corpus')}</span>`;
+            return r.target_id
+              ? `<a class="row2" href="#/sym/${r.target_id}" title="${esc(r.target_qual)}">${inner}</a>`
+              : `<div class="row2" title="${esc(r.target)}">${inner}</div>`;
+          }).join('')}</div>
+        </section>` : ''}
+
+        ${s.documented_in.length ? `<section>
+          <h2>Named in the docs of<span class="c mono">${s.documented_in.length}</span></h2>
+          <div class="list">${s.documented_in.map((r) => `<a class="row2" href="#/sym/${r.src_entity}" title="${esc(r.src_qual)}">
+            <span class="t">${esc(leafName(r.src_qual))}</span>
+            <span class="s">${esc(shortPath(r.path, d.root))}</span></a>`).join('')}</div>
+        </section>` : ''}
+
         <section>
           <h2>Reference mix</h2>
           <div class="list">${s.ref_kinds.map((r) => `<div class="row">
@@ -1205,15 +1278,23 @@ async function viewSearch(host, params) {
   const r = q ? await api('/api/search', { q, limit: 200, in: scope }) : { items: [], total: 0 };
   document.title = (q ? q + ' · ' : '') + 'search · ken';
   const symTab = scope === 'symbols';
+  const docTab = scope === 'docs';
   host.innerHTML = `<div class="wrap">
     <p class="eyebrow">Search</p>
     <h1>${q ? esc(q) : 'Everything'}</h1>
     <div class="tabs" style="margin-top:16px">
       <button data-scope="symbols" class="${symTab ? 'on' : ''}">Symbols</button>
-      <button data-scope="files" class="${symTab ? '' : 'on'}">Files</button>
+      <button data-scope="docs" class="${docTab ? 'on' : ''}">Docs</button>
+      <button data-scope="files" class="${!symTab && !docTab ? 'on' : ''}">Files</button>
     </div>
     <p class="dim mono" style="font-size:11px;margin-bottom:12px">${n(r.total)} ${r.total === 1 ? 'match' : 'matches'}${r.total > r.items.length ? ` · showing first ${r.items.length}` : ''}</p>
-    ${symTab ? `<table class="grid">
+    ${docTab ? `<table class="grid">
+      <thead><tr><th>what the author wrote</th><th>symbol</th></tr></thead>
+      <tbody>${r.items.map((x) => `<tr>
+        <td>${esc(x.excerpt || '').replace(/\u0001/g, '<mark>').replace(/\u0002/g, '</mark>')}</td>
+        <td>${hash(x.id, x.qualname)}<div class="path">${esc(shortPath(x.path, d.root))}:${x.line}</div></td></tr>`).join('') ||
+        '<tr><td colspan="2" class="empty">Nothing matched in documentation.</td></tr>'}</tbody></table>`
+      : symTab ? `<table class="grid">
       <thead><tr><th>symbol</th><th>kind</th><th class="r">line</th></tr></thead>
       <tbody>${r.items.map((x) => `<tr>
         <td>${hash(x.id, x.qualname)}<div class="path">${esc(shortPath(x.path, d.root))}</div></td>

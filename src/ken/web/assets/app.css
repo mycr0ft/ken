@@ -133,6 +133,38 @@ a.link:hover { color: var(--accent); border-bottom-color: rgba(224,164,94,.4); }
   font: 400 10px/1 var(--mono); padding: 2px 5px; border-radius: 3px;
   background: var(--panel-hi); color: var(--dim); border: 1px solid var(--line);
 }
+.badge.warn {
+  color: var(--bad); border-color: rgba(207,127,108,.45); background: rgba(207,127,108,.1);
+}
+
+/* ---------- documentation block ---------- */
+/* The doc comment is the author talking. Set it apart from the code below:
+   wider measure, no monospace, a rule on the left, and tags as a definition
+   list so parameters line up instead of running together as prose. */
+.docblock {
+  border-left: 2px solid var(--line-hi); padding: 2px 0 2px 16px; margin: 18px 0 22px;
+  max-width: 74ch;
+}
+.docmeta {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--dim); margin-bottom: 8px;
+}
+.docblock p {
+  margin: 0 0 9px; color: var(--ink-2); font-size: 13px; line-height: 1.62;
+}
+.docblock .doctags {
+  margin: 12px 0 0; display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 14px; row-gap: 5px; align-items: baseline;
+}
+.docblock .doctags dt { font-size: 11px; color: var(--accent); white-space: nowrap; }
+.docblock .doctags dd { margin: 0; color: var(--ink-2); font-size: 12.5px; line-height: 1.5; }
+.docblock pre.docpre {
+  margin: 0 0 10px; padding: 10px 12px; background: var(--bg-2); border-radius: var(--r);
+  border: 1px solid var(--line); overflow-x: auto;
+  font: 400 11.5px/1.55 var(--mono); color: var(--ink-2);
+}
+mark { background: rgba(224,164,94,.22); color: var(--ink); border-radius: 2px; }
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 9px; border: 1px solid var(--line); border-radius: 99px;
