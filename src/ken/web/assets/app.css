@@ -351,6 +351,7 @@ text.elabel { fill: var(--dim); font: 400 9.5px var(--mono); pointer-events: non
 .seqhead text.n { fill: var(--ink-2); opacity: .82; font: 400 10px var(--mono); }
 .seqhead:hover rect { stroke: var(--accent); }
 /* a boundary actor, not a real entity in the index */
+line.lifeline.ext { stroke-dasharray: 5 5; }
 .seqhead[data-kind="x"] text { fill: var(--dim); font-style: italic; }
 
 line.lifeline { stroke: #39414e; stroke-width: 1; stroke-dasharray: 4 4; }

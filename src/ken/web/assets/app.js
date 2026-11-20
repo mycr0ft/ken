@@ -1304,8 +1304,10 @@ function drawPackages(svg, d) {
 }
 
 // ------------------------------------------------------------------ sequence
-async function viewSequence(host, eid) {
-  const d = await api('/api/sequence', { id: eid, limit: 24, depth: 2 });
+async function viewSequence(host, params, eid) {
+  const limit = Number(params.get('limit') || 24);
+  const depth = Number(params.get('depth') || 2);
+  const d = await api('/api/sequence', { id: eid, limit, depth });
   if (!d) throw new Error('no such symbol');
   const e = d.entity;
   document.title = `${e.name} · sequence · ken`;
@@ -1314,7 +1316,14 @@ async function viewSequence(host, eid) {
       <div class="crumb">SEQUENCE DIAGRAM</div>
       <div class="h1line"><a class="sym" href="#/sym/${e.id}">${esc(e.qualname || e.name)}</a>
         <span class="dim mono" style="font-size:11px">${esc(shortPath(e.path))}:${e.line}</span></div>
-      <div class="sub">${d.messages.length} messages · ${d.lifelines.length} lifelines · depth ${d.depth}${d.truncated ? ` · showing ${d.messages.length} of ${n(d.total_calls)} call sites` : ''}</div>
+      <span class="sp" style="margin-left:auto"></span>
+      <div class="seg" data-limit>
+        ${[24, 48, 96].map((x) => `<button data-v="${x}" class="${x === d.limit ? 'on' : ''}">${x}</button>`).join('')}
+      </div>
+      <div class="seg" data-sdepth>
+        ${[1, 2, 3, 4].map((x) => `<button data-v="${x}" class="${x === depth ? 'on' : ''}">${x}</button>`).join('')}
+      </div>
+      <div class="sub">${d.messages.length} messages · ${d.lifelines.length} lifelines · depth ${d.depth}${d.truncated ? ` · first ${d.limit} of the trace` : ''}</div>
     </div>
     <div class="graphbox seqbox"><svg class="seqscene"></svg></div>
     <p class="dim" style="font-size:11.5px;margin-top:10px">
@@ -1322,12 +1331,23 @@ async function viewSequence(host, eid) {
       Calls into the caller's own class are drawn as self-messages. ${n(d.total_calls)} call sites were examined.
     </p>
   </div>`;
+  $$('[data-limit] button', host).forEach((b) => b.onclick = () => {
+    location.hash = `#/seq/${eid}?limit=${b.dataset.v}&depth=${depth}`;
+  });
+  $$('[data-sdepth] button', host).forEach((b) => b.onclick = () => {
+    location.hash = `#/seq/${eid}?limit=${limit}&depth=${b.dataset.v}`;
+  });
   drawSequence($('.seqscene', host), d);
 }
 
 function drawSequence(svg, d) {
   const TOP = 54, ROW = 30, HEAD = 40;
-  const lives = d.lifelines;
+  // keep the trace's own order but put the «external» boundary last: it is not
+  // an actor in the story, and sitting between two callers splits them apart
+  const order = d.lifelines.map((l, i) => i).sort((i, j) =>
+    (d.lifelines[i].kind === 'x') - (d.lifelines[j].kind === 'x') || i - j);
+  const lives = order.map((i) => d.lifelines[i]);
+  const at = order.reduce((m, orig, now) => { m[orig] = now; return m; }, {});
   // spread lifelines across the box when there are only a few of them, but
   // never squeeze below the width at which a message label stops fitting
   const boxW = (svg.parentElement ? svg.parentElement.clientWidth : 720) - 40;
@@ -1343,11 +1363,29 @@ function drawSequence(svg, d) {
       <rect width="124" height="${HEAD}" rx="3"/>
       <text x="62" y="17" text-anchor="middle">${esc(l.label.length > 20 ? l.label.slice(0, 19) + '…' : l.label)}</text>
       <text class="n" x="62" y="31" text-anchor="middle">${l.in} in · ${l.out} out</text></g>`);
-    parts.push(`<line class="lifeline" x1="${cx(i)}" y1="${TOP + HEAD}" x2="${cx(i)}" y2="${H - 20}"/>`);
+    // the boundary lifeline is dashed: nothing lives along it, the trace just
+    // reaches it and stops
+    parts.push(`<line class="lifeline${l.kind === 'x' ? ' ext' : ''}" x1="${cx(i)}" y1="${TOP + HEAD}" x2="${cx(i)}" y2="${H - 20}"/>`);
   });
+  // one activation bar per lifeline spanning the rows it takes part in, the
+  // way a UML sequence diagram shows a live call, instead of a tick per arrow.
+  // Drawn before the arrows so the heads land on the bar rather than under it;
+  // the «external» boundary gets no bar, nothing runs there.
+  const span = new Map();
   d.messages.forEach((m, i) => {
     const y = TOP + HEAD + 34 + i * ROW;
-    const a = m.s, b = m.d;  // s/d arrive as lifeline indices, not entity ids
+    for (const who of [at[m.s], at[m.d]]) {
+      if (lives[who].kind === 'x') continue;
+      const cur = span.get(who);
+      span.set(who, cur ? [Math.min(cur[0], y), Math.max(cur[1], y)] : [y, y]);
+    }
+  });
+  for (const [who, [y0, y1]] of span) {
+    parts.push(`<rect class="act" x="${cx(who) - 5}" y="${y0 - 8}" width="10" height="${Math.max(y1 - y0 + 16, 16)}" rx="1"/>`);
+  }
+  d.messages.forEach((m, i) => {
+    const y = TOP + HEAD + 34 + i * ROW;
+    const a = at[m.s], b = at[m.d];  // s/d arrive as lifeline indices, not entity ids
     const self = m.self || a === b;
     // «create» is the UML stereotype for construction. A construction arrives
     // as kind 'call' on a class lifeline whose label is the class itself, since
@@ -1356,10 +1394,12 @@ function drawSequence(svg, d) {
     const create = dl.kind === 'c' && m.label === dl.label;
     const label = `${m.n}. ${create ? '«create» ' : ''}${m.label}`;
     if (self) {
-      const x = cx(a) + 8;
-      parts.push(`<path class="msg" d="M${x} ${y} h38 v16 h-38"/>
-        <polygon class="msghead" points="${x},${y + 16} ${x + 8},${y + 12} ${x},${y + 8}"/>
-        <text class="mlabel" x="${x + 48}" y="${y + 12}">${esc(label)}</text>`);
+      // the loop hangs off the right of the lifeline, label after it, so the
+      // row still reads left-to-right like its neighbours
+      const x = cx(a);
+      parts.push(`<path class="msg" d="M${x} ${y} h34 v16 h-34"/>
+        <polygon class="msghead" points="${x},${y + 16} ${x + 9},${y + 12} ${x + 9},${y + 20}"/>
+        <text class="mlabel" x="${x + 42}" y="${y + 12}">${esc(label)}</text>`);
     } else {
       const x1 = cx(a), x2 = cx(b);
       const dir = x2 > x1 ? 1 : -1;
@@ -1368,19 +1408,7 @@ function drawSequence(svg, d) {
         <text class="mlabel" x="${(x1 + x2) / 2}" y="${y - 6}" text-anchor="middle">${esc(label)}</text>`);
     }
   });
-  // one activation bar per lifeline spanning the rows it takes part in, the
-  // way a UML sequence diagram shows a live call, instead of a tick per arrow
-  const span = new Map();
-  d.messages.forEach((m, i) => {
-    const y = TOP + HEAD + 34 + i * ROW;
-    for (const who of [m.s, m.d]) {
-      const cur = span.get(who);
-      span.set(who, cur ? [Math.min(cur[0], y), Math.max(cur[1], y)] : [y, y]);
-    }
-  });
-  for (const [who, [y0, y1]] of span) {
-    parts.push(`<rect class="act" x="${cx(who) - 5}" y="${y0 - 8}" width="10" height="${Math.max(y1 - y0 + 16, 16)}" rx="1"/>`);
-  }
+
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
   // sequence diagrams are read line by line, so keep labels at their real
@@ -1417,7 +1445,7 @@ async function render() {
       await viewGraph(host, params, Number(seg[1]));
     } else if (name === 'uml') await viewUml(host, params);
     else if (name === 'packages') await viewPackages(host);
-    else if (name === 'seq') await viewSequence(host, Number(seg[1]));
+    else if (name === 'seq') await viewSequence(host, params, Number(seg[1]));
     else if (name === 'metrics') await viewMetrics(host, params);
     else if (name === 'search') await viewSearch(host, params);
     else host.innerHTML = `<div class="wrap"><div class="err">No route for ${esc(raw)}</div></div>`;
