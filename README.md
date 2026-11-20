@@ -109,7 +109,7 @@ DB-derived and re-reads on navigation:
 | `#/graph/<id>?dir=up\|down&depth=` | call graph, bucketed by file so 200 edges stay readable |
 | `#/uml?path=&limit=` | class diagram: packages as panels, inheritance solid, use dashed |
 | `#/packages` | package diagram: one box per directory, arrows for cross-package dependencies |
-| `#/seq/<id>` | sequence diagram: an interaction trace out of one operation, one lifeline per class |
+| `#/seq/<id>?limit=&depth=` | sequence diagram: an interaction trace out of one operation, one lifeline per class |
 | `#/search?q=&in=symbols\|files` | full-text search over names, qualified names, and paths |
 
 Two things worth knowing about the diagrams. The class diagram selects a
@@ -135,10 +135,17 @@ over the same index, not a different model:
   classes that own the called methods (or the file, when a call leaves a class),
   messages are the `call`/`instantiate` refs in call-site order. Calls into the
   caller's own class are marked `self` and drawn as a loop rather than expanded,
-  which keeps helper calls from turning the diagram into a tree.
+  which keeps helper calls from turning the diagram into a tree. A call whose
+  target is outside the index is still an interaction, so it lands on a single
+  dashed `«external»` lifeline at the end rather than being dropped: otherwise a
+  method that only calls library code draws as an empty canvas that reads as
+  "no interactions".
 
 The sequence view keeps its natural size and scrolls instead of scaling to the
-box: 10 px labels shrunk to 7 px are worse than a scrollbar.
+box: 10 px labels shrunk to 7 px are worse than a scrollbar. Message count and
+walk depth are controls in its header and live in the hash, so a trace is a link
+you can hand to someone else. When the cap cuts the trace the sub-line says
+`first N of the trace` - it never claims to show everything it hid.
 
 ## Export the model as SysML v2
 
