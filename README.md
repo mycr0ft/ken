@@ -89,6 +89,34 @@ trusting it.
 The walker is iterative with an explicit work list: generated headers (LLVM
 intrinsic tables) nest deeper than Python's recursion limit.
 
+## Browse the index in a browser
+
+`ken web` serves a read-only single-page front end over an existing index. No
+extra dependencies, no build step: the server is `http.server` plus one JSON
+endpoint per question, and the assets ship inside the package.
+
+    ken --db code.db web --port 8000 --open
+
+`--db` is a global option, so it precedes the subcommand. Every view is
+DB-derived and re-reads on navigation:
+
+| route | what it answers |
+| --- | --- |
+| `#/` | corpus shape: languages, line counts, resolution mix, biggest packages |
+| `#/files?path=` | the directory tree, one row per file with entity and LOC counts |
+| `#/file/<id>` | source with entity bands, imports, dependents, exports |
+| `#/sym/<id>` | one symbol: declaration site, children, calls in and out, references |
+| `#/graph/<id>?dir=up\|down&depth=` | call graph, bucketed by file so 200 edges stay readable |
+| `#/uml?path=&limit=` | class diagram: packages as panels, inheritance solid, use dashed |
+| `#/search?q=&in=symbols\|files` | full-text search over names, qualified names, and paths |
+
+Two things worth knowing about the diagrams. The class diagram selects a
+*connected* neighbourhood by breadth-first walk from the structurally busiest
+classes, capped per file, per directory, and per class name: a generated
+parser's three hundred sibling context classes would otherwise take every slot.
+And the call graph buckets by file rather than drawing one node per symbol,
+because a two-hundred-node graph is a hairball at any zoom level.
+
 ## Limits, honestly
 
 * Name-based resolution, no type inference: overloads, virtual dispatch, and

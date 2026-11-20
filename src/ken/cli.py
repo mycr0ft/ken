@@ -264,6 +264,12 @@ def cmd_metrics(a) -> None:
         print(f"  {n:>4}x {qual}")
 
 
+def cmd_web(a) -> None:
+    from .web.server import serve
+
+    serve(a.db, host=a.host, port=a.port, open_browser=a.open_browser)
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="ken", description="multi-language code comprehension")
     p.add_argument("--db", default="ken.db")
@@ -310,6 +316,14 @@ def main(argv=None) -> None:
     s = sub.add_parser("metrics")
     s.add_argument("--top", type=int, default=15)
     s.set_defaults(fn=cmd_metrics)
+
+    s = sub.add_parser("web", help="serve the read-only browser front end")
+    s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--host", default="127.0.0.1",
+                   help="bind address; 0.0.0.0 to let the LAN look")
+    s.add_argument("--open", dest="open_browser", action="store_true",
+                   help="open the default browser once the server is up")
+    s.set_defaults(fn=cmd_web)
 
     a = p.parse_args(argv)
     a.fn(a)

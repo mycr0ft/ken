@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+     License, v. 2.0. If a copy of the MPL was not distributed with this
+     file, You can obtain one at https://mozilla.org/MPL/2.0/. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ken · code comprehension</title>
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230e1013'/%3E%3Cpath d='M4 3v10M4 8l6-5M4 8l6 5' stroke='%23e0a45e' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="mark">◈</span>ken <small>index</small></a>
+  <div class="dbname" id="dbname"></div>
+  <form class="search" id="searchform" autocomplete="off">
+    <span class="ico">⌕</span>
+    <input id="q" type="search" name="q" placeholder="symbol, file, path…" aria-label="Search symbols">
+    <kbd>/</kbd>
+    <div class="results" id="results" hidden></div>
+  </form>
+  <nav class="topnav" id="topnav">
+    <a href="#/" data-nav="overview">Overview</a>
+    <a href="#/files" data-nav="files">Files</a>
+    <a href="#/uml" data-nav="uml">Diagrams</a>
+    <a href="#/metrics" data-nav="metrics">Metrics</a>
+  </nav>
+</header>
+<main id="view" role="main"></main>
+<script src="/assets/app.js"></script>
+</body>
+</html>
