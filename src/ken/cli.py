@@ -314,6 +314,48 @@ def cmd_sysml(a) -> None:
           file=sys.stderr)
 
 
+def cmd_langs(a) -> None:
+    """Self-test every language record: is it complete, and does it parse?
+
+    "Wired" is otherwise a claim about nine separate places.  This makes it a
+    test: every field a record needs is present, no extension is claimed twice,
+    and the record's own fixture goes through extract() and comes out with
+    entities and at least one reference.  Adding a language means adding a
+    record; this is what tells you the record is finished.
+    """
+    from .langs import SPECS, extract
+
+    bad = 0
+    seen: dict[str, str] = {}
+    print(f"{'lang':8} {'exts':>4} {'ents':>5} {'refs':>5} {'deps':>5}  status")
+    for name, s in SPECS.items():
+        problems = []
+        for f in ("exts", "grammar", "spec", "decisions", "fixture"):
+            if not getattr(s, f):
+                problems.append(f"no {f}")
+        for ext in s.exts:
+            if ext in seen and seen[ext] != name:
+                problems.append(f"{ext} also claimed by {seen[ext]}")
+            seen[ext] = name
+        ents = refs = deps = 0
+        if s.fixture:
+            try:
+                b = extract(f"<check>{s.exts[0]}", name, s.fixture.encode())
+                ents, refs, deps = len(b.ents), len(b.refs), len(b.deps)
+                if not ents:
+                    problems.append("fixture yields no entities")
+                if not refs:
+                    problems.append("fixture yields no references")
+            except Exception as exc:                     # noqa: BLE001
+                problems.append(f"{type(exc).__name__}: {exc}")
+        status = "; ".join(problems) or "ok"
+        bad += bool(problems)
+        print(f"{name:8} {len(s.exts):4} {ents:5} {refs:5} {deps:5}  {status}")
+    if bad:
+        print(f"{bad} of {len(SPECS)} languages incomplete", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def cmd_web(a) -> None:
     from .web.server import serve
 
@@ -372,6 +414,10 @@ def main(argv=None) -> None:
     s.add_argument("--out", default="-", help="write here instead of stdout")
     s.add_argument("--max-classes", dest="max_classes", type=int, default=4000)
     s.set_defaults(fn=cmd_sysml)
+
+    s = sub.add_parser("langs", help="check the language records (extensions, "
+                                     "grammar, parse table, fixture)")
+    s.set_defaults(fn=cmd_langs)
 
     s = sub.add_parser("web", help="serve the read-only browser front end")
     s.add_argument("--port", type=int, default=8000)
