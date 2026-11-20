@@ -8,7 +8,9 @@ from __future__ import annotations
 import os
 import sqlite3
 
-SCHEMA = """
+from .langs import doc_links
+
+SCHEMA_TABLES = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, lang TEXT NOT NULL,
@@ -17,33 +19,48 @@ CREATE TABLE IF NOT EXISTS entities(
   id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, kind TEXT NOT NULL,
   name TEXT NOT NULL, qualname TEXT NOT NULL, parent_id INTEGER,
   line INTEGER, end_line INTEGER, complexity INTEGER DEFAULT 0,
-  decl INTEGER DEFAULT 0);
+  decl INTEGER DEFAULT 0, doc TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS refs(
   id INTEGER PRIMARY KEY, src_file INTEGER NOT NULL, src_entity INTEGER,
   kind TEXT NOT NULL, target TEXT NOT NULL, line INTEGER,
   target_id INTEGER, resolution TEXT, candidates INTEGER);
+CREATE TABLE IF NOT EXISTS doc_links(
+  id INTEGER PRIMARY KEY, src_entity INTEGER NOT NULL,
+  target TEXT NOT NULL, target_id INTEGER);
 CREATE TABLE IF NOT EXISTS file_deps(
   id INTEGER PRIMARY KEY, src_file INTEGER NOT NULL, dst_file INTEGER,
   kind TEXT NOT NULL, raw TEXT);
+"""
+
+SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_ent_name ON entities(name);
 CREATE INDEX IF NOT EXISTS ix_ent_qual ON entities(qualname);
 CREATE INDEX IF NOT EXISTS ix_ent_file ON entities(file_id);
 CREATE INDEX IF NOT EXISTS ix_ref_target ON refs(target);
 CREATE INDEX IF NOT EXISTS ix_ref_src ON refs(src_entity);
+CREATE INDEX IF NOT EXISTS ix_doclink_src ON doc_links(src_entity);
+CREATE INDEX IF NOT EXISTS ix_doclink_target ON doc_links(target);
 CREATE INDEX IF NOT EXISTS ix_dep_src ON file_deps(src_file);
 CREATE INDEX IF NOT EXISTS ix_dep_dst ON file_deps(dst_file);
 CREATE VIRTUAL TABLE IF NOT EXISTS ent_fts USING fts5(name, qualname, content='entities', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS doc_fts USING fts5(doc, content='entities', content_rowid='id');
 CREATE TRIGGER IF NOT EXISTS ent_ai AFTER INSERT ON entities BEGIN
   INSERT INTO ent_fts(rowid,name,qualname) VALUES(new.id,new.name,new.qualname);
+  INSERT INTO doc_fts(rowid,doc) VALUES(new.id,new.doc);
 END;
 CREATE TRIGGER IF NOT EXISTS ent_ad AFTER DELETE ON entities BEGIN
   INSERT INTO ent_fts(ent_fts,rowid,name,qualname) VALUES('delete',old.id,old.name,old.qualname);
+  INSERT INTO doc_fts(doc_fts,rowid,doc) VALUES('delete',old.id,old.doc);
 END;
 CREATE TRIGGER IF NOT EXISTS ent_au AFTER UPDATE ON entities BEGIN
   INSERT INTO ent_fts(ent_fts,rowid,name,qualname) VALUES('delete',old.id,old.name,old.qualname);
+  INSERT INTO doc_fts(doc_fts,rowid,doc) VALUES('delete',old.id,old.doc);
   INSERT INTO ent_fts(rowid,name,qualname) VALUES(new.id,new.name,new.qualname);
+  INSERT INTO doc_fts(rowid,doc) VALUES(new.id,new.doc);
 END;
 """
+
+SCHEMA = SCHEMA_TABLES + SCHEMA_INDEXES
 
 
 def connect(db: str) -> sqlite3.Connection:
@@ -52,17 +69,33 @@ def connect(db: str) -> sqlite3.Connection:
     return con
 
 
+def _migrate(con: sqlite3.Connection) -> None:
+    """Add the doc column to an index built before doc comments were read.
+
+    An index is a cache of a corpus, never the corpus itself, so widening the
+    schema in place and letting the next `index` fill the column is the honest
+    move: refusing to open an old DB would make `ken web` fail after an upgrade
+    for no reason a reader would guess.
+    """
+    cols = {r[1] for r in con.execute("PRAGMA table_info(entities)")}
+    if cols and "doc" not in cols:
+        con.execute("ALTER TABLE entities ADD COLUMN doc TEXT NOT NULL DEFAULT ''")
+
+
 def init(db: str) -> sqlite3.Connection:
     fresh = not os.path.exists(db)
     con = sqlite3.connect(db)
-    con.executescript(SCHEMA)
+    con.executescript(SCHEMA_TABLES)
+    _migrate(con)
+    con.executescript(SCHEMA_INDEXES)
     if fresh:
         con.execute("INSERT INTO ent_fts(ent_fts) VALUES('rebuild')")
+        con.execute("INSERT INTO doc_fts(doc_fts) VALUES('rebuild')")
     return con
 
 
 def reset(con: sqlite3.Connection) -> None:
-    for t in ("refs", "file_deps", "entities", "files"):
+    for t in ("refs", "doc_links", "file_deps", "entities", "files"):
         con.execute(f"DELETE FROM {t}")
     con.commit()
 
@@ -78,12 +111,18 @@ def add_file(con: sqlite3.Connection, path: str, lang: str, src: bytes, b) -> in
     ent_ids = []
     for e in b.ents:
         cur = con.execute(
-            "INSERT INTO entities(file_id,kind,name,qualname,parent_id,line,end_line,complexity,decl)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO entities(file_id,kind,name,qualname,parent_id,line,end_line,complexity,decl,doc)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
             (fid, e["kind"], e["name"], e["qualname"],
              ent_ids[e["parent"]] if e["parent"] is not None else None,
-             e["line"], e["end_line"], e.get("complexity", 0), e.get("decl", 0)))
+             e["line"], e["end_line"], e.get("complexity", 0), e.get("decl", 0),
+             e.get("doc", "")))
         ent_ids.append(cur.lastrowid)
+
+    for idx, e in enumerate(b.ents):
+        for target in doc_links(e.get("doc", ""), e["qualname"]):
+            con.execute("INSERT INTO doc_links(src_entity,target) VALUES(?,?)",
+                        (ent_ids[idx], target))
 
     for r in b.refs:
         con.execute(
@@ -302,6 +341,28 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
     con.executemany("UPDATE refs SET target_id=?,resolution=?,candidates=? WHERE id=?", updates)
     con.commit()
     return stats
+
+
+def resolve_doc_links(con: sqlite3.Connection) -> int:
+    """Point each `@see`/`{@link}` cross-reference at the entity it names.
+
+    Only the ones the corpus actually defines get a target; the rest keep their
+    text so the symbol page can still say "documented as referring to Foo" when
+    Foo is a JDK class nobody indexed.
+    """
+    rows = con.execute("SELECT id,target FROM doc_links WHERE target_id IS NULL").fetchall()
+    n = 0
+    for link_id, target in rows:
+        base = target.replace("::", ".").split(".")[-1]
+        row = con.execute(
+            "SELECT id FROM entities WHERE qualname=? OR name=? "
+            "ORDER BY (kind IN ('function','method','class','struct','interface','enum')) DESC,"
+            " decl ASC LIMIT 1", (target, base)).fetchone()
+        if row:
+            con.execute("UPDATE doc_links SET target_id=? WHERE id=?", (row[0], link_id))
+            n += 1
+    con.commit()
+    return n
 
 
 def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:

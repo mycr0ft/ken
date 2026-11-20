@@ -76,6 +76,7 @@ def cmd_index(a) -> None:
     if pruned:
         print(f"pruned {pruned} macro look-alikes", file=sys.stderr)
     rs = store.resolve_refs(con)
+    dl = store.resolve_doc_links(con)
     ds = store.resolve_file_deps(con)
     con.commit()
     total = sum(rs.values())
@@ -86,6 +87,11 @@ def cmd_index(a) -> None:
     print(f"      {100.0 * hits / max(total, 1):.1f}% of all refs name one definition, "
           f"{100.0 * hits / max(intree, 1):.1f}% of the {intree} in-tree refs")
     print("deps  " + "  ".join(f"{k}={v}" for k, v in ds.items()))
+    q = con.execute("SELECT COUNT(*), SUM(doc<>'') FROM entities WHERE kind IN"
+                    " ('function','method','class','struct','interface','enum')").fetchone()
+    if q[0]:
+        print(f"docs  {q[1] or 0}/{q[0]} public entities documented "
+              f"({100.0 * (q[1] or 0) / q[0]:.1f}%), {dl} cross-references resolved")
     if skipped:
         top = ", ".join(f"{ext} {n}" for ext, n in skipped.most_common(5))
         print(f"skipped {sum(skipped.values())} files in languages this build "
