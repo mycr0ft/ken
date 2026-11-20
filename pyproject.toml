@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ken"
+version = "0.1.0"
+description = "Multi-language code comprehension: entities, references and metrics for C, C++, Python and Java"
+requires-python = ">=3.10"
+dependencies = [
+  "tree-sitter>=0.26",
+  "tree-sitter-c",
+  "tree-sitter-cpp",
+  "tree-sitter-python",
+  "tree-sitter-java",
+]
+
+[project.scripts]
+ken = "ken.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ken"]
