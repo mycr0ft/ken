@@ -45,7 +45,10 @@ refs  exact=3473  scoped=208  unique=2  ambiguous=286  external=520  unresolved=
 deps  resolved=163  unresolved=226
 ```
 
-The first percentage counts every reference, the second drops the ones naming
+Files in languages this build does not read are counted and named on stderr
+rather than walked past: `indexed 0 files` is a true statement about a Rust tree
+only if it says how many `.rs` files it saw. The first percentage counts every
+reference, the second drops the ones naming
 something the corpus never introduces, which is the only denominator on which
 a 19k-line tree and a 240k-line tree are comparable. The classes mean what they
 say: `external` is a name no entity anywhere in the index carries (`printf`,

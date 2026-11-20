@@ -152,3 +152,25 @@ def test_a_name_the_corpus_never_defines_is_external(con):
     rows = q(con, "SELECT resolution FROM refs WHERE target = 'CHECK'")
     assert rows, "the CHECK call was not indexed"
     assert {r[0] for r in rows} == {"external"}, rows
+
+
+def test_unindexed_languages_are_tallied_not_ignored(tmp_path):
+    """A tree full of Rust must not index as an empty tree with no explanation.
+
+    `ken` supports four languages; the corpora people point it at contain more.
+    Walking past `foo.rs` silently reads as "there is nothing here", which is
+    the one answer that teaches the user something false.
+    """
+    import collections
+
+    from ken.cli import iter_sources
+
+    (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
+    (tmp_path / "b.rs").write_text("fn f() {}\n")
+    (tmp_path / "c.go").write_text("package p\n")
+    (tmp_path / "notes.md").write_text("# not code\n")
+    skipped = collections.Counter()
+    got = list(iter_sources([str(tmp_path)], skipped))
+    assert [os.path.basename(p) for p, _ in got] == ["a.c"], got
+    assert skipped[".rs"] == 1 and skipped[".go"] == 1, skipped
+    assert ".md" not in skipped, "documentation is not a missing language"

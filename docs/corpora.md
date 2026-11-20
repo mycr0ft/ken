@@ -117,5 +117,15 @@ being guessed at.
 ## Next
 
 Rust, Go and JavaScript corpora, one small project each, chosen the same way:
-small, and shaped to break something. See `docs/languages.md` for the plan and
-the corpus picks.
+small, and shaped to break something. Cloned, not yet indexable:
+
+| corpus | lang | pin | files | loc |
+| --- | --- | --- | --- | --- |
+| BurntSushi/memchr | Rust | `bd6068c` | 45 (`src/`) | 15,854 |
+| spf13/pflag | Go | `7b3c6eb` | 76 | 13,577 |
+| expressjs/express | JavaScript | `43fca52` | 6 (`lib/`) | 2,765 |
+
+They stay unindexable until `SPEC["rust"]` and friends exist. Pointing `ken` at
+one of them now says `indexed 0 files` and, on stderr, `skipped 45 files in
+languages this build does not index: .rs 45`, which is the gap stated instead of
+implied. See `docs/languages.md` for the plan and the per-language rules.

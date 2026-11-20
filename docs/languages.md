@@ -187,14 +187,20 @@ Gate: calls whose target came from an import binding resolve ≥ 80%, and
 One small project per language, same criterion as the existing four: small
 enough to re-index in a second, shaped to break something specific.
 
-| language | corpus | size | why it is the right kind of hard |
-| --- | --- | --- | --- |
-| Rust | `BurntSushi/memchr` | ~10k loc | plain `fn`s, `unsafe`, trait impls, several modules with `mod` declarations: tests the `impl`/`mod` model without a macro wall |
-| Rust (stretch) | `dtolnay/thiserror` | ~3k loc | a crate whose entire public API is a derive macro: proves the "empty file" story |
-| Go | `spf13/pflag` | ~7k loc | interfaces with several implementations, method values, one package spread over many files |
-| Go (stretch) | `pkg/errors` | ~600 loc | tiny, checks that a clean corpus really does resolve to ~100% |
-| JavaScript | `expressjs/express` | ~1.4k loc in `lib/` | CommonJS, `module.exports`, prototype methods, heavy `require` graph |
-| JavaScript (stretch) | `chalk/chalk` | ~500 loc | ESM-only: the other module system, so the binding table is exercised both ways |
+Three of these are cloned already, in `~/proj/ken-corpora`, with the sizes
+measured rather than guessed:
+
+| language | corpus | pin | files | loc | why it is the right kind of hard |
+| --- | --- | --- | --- | --- | --- |
+| Rust | `BurntSushi/memchr` | `bd6068c` | 45 in `src/` | 15,854 | plain `fn`s, `unsafe`, trait impls, several modules declared with `mod`; no macro wall worth speaking of. `benchmarks/` holds another 53k lines of generated lookup tables and should be indexed deliberately or not at all |
+| Go | `spf13/pflag` | `7b3c6eb` | 76 | 13,577 | interfaces with several implementations, method values, and one package spread across 76 files in a single directory: the package model without a directory tree |
+| JavaScript | `expressjs/express` | `43fca52` | 6 in `lib/` (142 total) | 2,765 (`lib/`), 22,046 all | CommonJS, `module.exports`, prototype methods, a dense `require` graph. `lib/` is the library; `test/` is 17k lines of `require` plus assertion chains, which is the real binding-table test |
+
+Stretch corpora, once the first three pass their gates: `dtolnay/thiserror`
+(Rust, ~3k loc, an API that is entirely a derive macro, so it proves the
+"honestly empty file" story), `pkg/errors` (Go, ~600 loc, checks that a clean
+corpus really does resolve to ~100%), and `chalk/chalk` (JavaScript, ESM-only,
+the other module system).
 
 ## Effort
 

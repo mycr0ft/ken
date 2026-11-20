@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import os
 import sys
 import time
@@ -17,19 +18,34 @@ SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache_
              "build", "dist", ".mypy_cache", ".pytest_cache", ".tox", "target"}
 
 
-def iter_sources(paths):
+# extensions that are data or documentation rather than code, so an unindexed
+# file of one of these kinds is not evidence that a language is missing
+NONCODE = {".md", ".rst", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini",
+           ".cfg", ".lock", ".csv", ".tsv", ".png", ".jpg", ".svg", ".pdf",
+           ".gz", ".zip", ".po", ".pot", ".desktop", ".patch", ".diff"}
+
+
+def iter_sources(paths, skipped=None):
+    """Yield (path, lang).  Unknown extensions are tallied in *skipped* so the
+    caller can say which languages the tree contains but this build cannot
+    read, instead of reporting an empty index as if the tree were empty."""
     for p in paths:
         if os.path.isfile(p):
             lang = EXTS.get(os.path.splitext(p)[1].lower())
             if lang:
                 yield p, lang
+            elif skipped is not None:
+                skipped[os.path.splitext(p)[1].lower()] += 1
             continue
         for root, dirs, files in os.walk(p):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
             for f in files:
-                lang = EXTS.get(os.path.splitext(f)[1].lower())
+                ext = os.path.splitext(f)[1].lower()
+                lang = EXTS.get(ext)
                 if lang:
                     yield os.path.join(root, f), lang
+                elif skipped is not None and ext and ext not in NONCODE:
+                    skipped[ext] += 1
 
 
 def cmd_index(a) -> None:
@@ -38,7 +54,8 @@ def cmd_index(a) -> None:
     t0 = time.time()
     n_files = n_ent = n_ref = 0
     failed = []
-    for i, (path, lang) in enumerate(iter_sources(a.paths), 1):
+    skipped = collections.Counter()
+    for i, (path, lang) in enumerate(iter_sources(a.paths, skipped), 1):
         try:
             with open(path, "rb") as fh:
                 src = fh.read()
@@ -69,6 +86,10 @@ def cmd_index(a) -> None:
     print(f"      {100.0 * hits / max(total, 1):.1f}% of all refs name one definition, "
           f"{100.0 * hits / max(intree, 1):.1f}% of the {intree} in-tree refs")
     print("deps  " + "  ".join(f"{k}={v}" for k, v in ds.items()))
+    if skipped:
+        top = ", ".join(f"{ext} {n}" for ext, n in skipped.most_common(5))
+        print(f"skipped {sum(skipped.values())} files in languages this build "
+              f"does not index: {top}", file=sys.stderr)
     if failed:
         print(f"{len(failed)} files failed to parse")
         for path, msg in failed[:5]:
