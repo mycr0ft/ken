@@ -55,6 +55,138 @@ def first_child(node, *types):
     return None
 
 
+# ---------------------------------------------------------------- doc comments
+#
+# Two shapes, not one.  C, C++, Java, Rust, Go and JavaScript put the doc in a
+# comment node immediately before the declaration, as a sibling; Python puts it
+# inside the body as the first statement.  Both are read here so that one
+# function can be called from `add_ent` for every language.
+
+COMMENT_TYPES = ("comment", "line_comment", "block_comment")
+
+#: tags whose argument is a cross-reference to another entity.  These are the
+#: edges the parser cannot see: `@see`, Doxygen `\ref`, Javadoc `{@link}`.
+LINK_TAGS = ("@see", "\\see", "\\sa", "@ref", "\\ref", "@link", "\\link",
+             "@linkplain", "{@link", "{@linkplain")
+
+
+def _clean_doc(raw: str) -> str:
+    """Comment text without the comment syntax."""
+    txt = raw.strip()
+    for opener in ("/**", "/*!", "/*", "///", "//!", "//"):
+        if txt.startswith(opener):
+            txt = txt[len(opener):]
+            break
+    if txt.endswith("*/"):
+        txt = txt[:-2]
+    lines = []
+    for line in txt.splitlines():
+        s = line.strip()
+        for pre in ("///", "//!", "//", "*"):
+            if s.startswith(pre):
+                s = s[len(pre):].strip()
+                break
+        lines.append(s)
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _clean_docstring(raw: str) -> str:
+    """Python docstring text, dedented, without the quotes."""
+    txt = raw.strip()
+    for q in ('"""', "'''", 'r"""', "r'''"):
+        if txt.startswith(q):
+            txt = txt[len(q):]
+            break
+    for q in ('"""', "'''"):
+        if txt.endswith(q):
+            txt = txt[:-len(q)]
+            break
+    lines = txt.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    body = [l for l in lines[1:] if l.strip()]
+    indent = min((len(l) - len(l.lstrip()) for l in body), default=0)
+    out = [lines[0].strip()]
+    out += [l[indent:].rstrip() for l in lines[1:]]
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
+
+
+def attached_doc(node, lang: str, src: bytes) -> str:
+    """The documentation written for *node*, or "" when there is none.
+
+    A comment counts as attached only when it touches the declaration line: a
+    paragraph of prose three lines above a function documents the file, not the
+    function, and treating it as the function's doc is how a doc-coverage metric
+    becomes a lie.
+    """
+    body = node.child_by_field_name("body")
+    if body is not None:
+        first = first_child(body, "expression_statement")
+        if first is not None and body.named_children and body.named_children[0] is first:
+            lit = first_child(first, "string", "concatenated_string")
+            if lit is not None:
+                return _clean_docstring(text(src, lit))
+    parts = []
+    cursor_line = node.start_point[0]
+    prev = node.prev_named_sibling
+    while prev is not None and prev.type in COMMENT_TYPES:
+        if prev.end_point[0] + 1 < cursor_line:
+            break
+        parts.append(text(src, prev))
+        cursor_line = prev.start_point[0]
+        prev = prev.prev_named_sibling
+    if not parts:
+        return ""
+    return _clean_doc("\n".join(reversed(parts)))
+
+
+def doc_links(doc: str, entity_qualname: str = "") -> list[str]:
+    """Cross-references named in a doc block: `@see`, `\\ref`, `{@link}`.
+
+    Kept beside the doc text rather than folded into `refs`, because a see-also
+    is a human's judgement about relevance, not a reference the compiler would
+    resolve, and mixing the two would flatter the resolution figures.
+    """
+    out, seen = [], set()
+    for line in doc.splitlines():
+        low = line.lower()
+        for tag in LINK_TAGS:
+            pos = low.find(tag.lower())
+            while pos >= 0:
+                rest = line[pos + len(tag):].lstrip(" :")
+                if rest.startswith("}"):
+                    rest = rest[1:].lstrip(" :")
+                tok = rest.split()[0] if rest.split() else ""
+                tok = tok.strip("{}<>,;:()[]`'\"")
+                if tok and not tok.startswith(("http://", "https://")):
+                    # Javadoc writes a member as `#reset()`; C++/Python/JSDoc
+                    # write a qualified name as `a.b` or `a::b`, so a leading
+                    # hash is the member marker and any later one is a label.
+                    if tok.startswith("#"):
+                        tok = tok[1:]
+                    else:
+                        tok = tok.split("#")[0]
+                    tok = tok.strip(".")
+                if tok and tok != entity_qualname and tok not in seen and \
+                        (tok[0].isalpha() or tok[0] == "_"):
+                    seen.add(tok)
+                    out.append(tok)
+                nxt = low.find(tag.lower(), pos +
+                                len(tag))
+                pos = nxt
+    return out
+
+
 def strip_template(s: str) -> str:
     """Drop template arguments: 'std::vector<int>' -> 'std::vector'."""
     out, depth = [], 0
@@ -155,6 +287,7 @@ class Builder:
             "parent": self.stack[-1] if self.stack else None,
             "_node": node,
             "complexity": 0,
+            "doc": attached_doc(node, self.lang, self.src),
         }
         self.ents.append(e)
         self._by_node[id(node)] = len(self.ents) - 1
