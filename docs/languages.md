@@ -19,25 +19,69 @@ silently indexes nothing.
 
 ## What a language costs today
 
-Nine places know a language exists. Only two of them are the interesting work.
+One record. `SPECS` at the bottom of `langs.py` holds a `LangSpec` per language,
+and every field a language needs arrives with it:
+
+```python
+"python": LangSpec(
+    exts=(".py", ".pyi"),                       # what the file walker claims
+    grammar=tree_sitter_python,                # the binding module
+    spec=SPEC["python"],                       # node type -> ent / ref / dep
+    decisions=frozenset(DECISIONS["python"]),  # what counts as a branch
+    post=(_py_imports, _py_inherits),          # passes after the main walk
+    external=COMMON_EXTERNAL,                  # names that live outside the tree
+    module_paths=True,                         # `a.b` names the file a/b
+    import_suffixes=(".py", "/__init__.py"),   # what an import may resolve to
+    family="python",                           # whose names it may resolve against
+    fixture="import os ...",                   # proof that it parses
+),
+```
+
+`extract()` reads the record and runs its passes; `store.py` asks the record
+whether a name is external (`spec.external`), which names share a name space
+(`spec.family`) and how an import names a file (`module_paths`,
+`import_suffixes`). Neither file names a language, and
+`tests/test_lang_registry.py::test_only_langs_names_a_language` fails if a
+`"rust"`-style literal reappears anywhere else in the package. That is the
+property worth keeping: a resolver that branches on `fam == "java"` cannot be
+extended without being edited.
+
+`EXTS` and `MODULES` still exist as views derived from `SPECS`, because the
+file walker and the parser only want one mapping; they are not a second source
+of truth.
+
+The real work per language is still the parse table, and it stays that way:
 
 | # | where | what | per language |
 | --- | --- | --- | --- |
-| 1 | `langs.py:21` `EXTS` | file extension to language | one line per extension |
-| 2 | `langs.py:29` `MODULES` | language to tree-sitter binding | one line, or one function for a grammar that ships two |
-| 3 | `langs.py:352` `SPEC[lang]` | node type to `("ent", kind, name_fn[, guard])` or `("ref", rkind, target_fn)` | **the real work** |
-| 4 | `langs.py:413` `DECISIONS[lang]` | node types that add a branch to complexity | a set of 6-12 types |
-| 5 | `langs.py` helpers | name and target extraction, declaration-scope guards | 1-3 small functions |
-| 6 | `langs.py` `_DECL_SCOPES`, `CALLABLE` | which parents make a declaration real; which kinds can be called | new tuple per language |
-| 7 | `store.py:178` `_outside(fam, target)` | names that are external by definition | one name set |
-| 8 | `store.py` `CALLEE` | entity kinds that can be a call target | add this language's kinds |
-| 9 | `store.py:311` file-dep probing | how an `import`/`#include`/`mod` string names a file | new probe per module style |
+| 1 | `langs.py` `SPECS[name].spec` | node type to `("ent", kind, name_fn[, guard])` or `("ref", rkind, target_fn)` | **the real work** |
+| 2 | `langs.py` helpers | name and target extraction, declaration-scope guards | 1-3 small functions |
+| 3 | `SPECS[name].decisions` | node types that add a branch to complexity | a set of 6-12 types |
+| 4 | `SPECS[name].external` | names that are external by definition | one name set |
+| 5 | `CALLABLE`, `CALLEE` | which kinds can be called, which can be a call target | add this language's kinds |
+| 6 | `SPECS[name].module_paths`, `.import_suffixes` | how an `import`/`#include`/`mod` string names a file | a spelling, a suffix tuple |
+
+Everything else is a field on the record: extensions, grammar module, post-walk
+passes, name-space family, and a fixture. Adding a language means writing one
+`LangSpec` and running `ken langs`, which checks the record for completeness,
+checks no extension is claimed twice, and puts the fixture through the real
+`extract()` requiring entities and at least one reference:
+
+```
+$ ken langs
+lang     exts  ents  refs  deps  status
+c           2     3     1     0  ok
+cpp         9     5     2     0  ok
+python      2     3     2     1  ok
+java        1     2     2     1  ok
+```
 
 Free, because it works off entity *kind* and target *text* rather than syntax:
 the SQLite schema, the iterative walker, FTS, the whole resolution pass, the
 complexity metric, `summary`, every CLI verb, and all four diagrams. That is
 the payoff of the `SPEC`-table design and the reason adding a language is a
 table plus a resolver hook rather than a new indexer.
+
 
 ## Node shapes (verified)
 
@@ -162,12 +206,12 @@ Gate: calls whose target came from an import binding resolve ≥ 80%, and
    resolution mix per index; extend it with a per-language line and keep it in
    the repo. Every step below has a number attached, and a step that does not
    move its number is not finished.
-1. **Registry.** Nine seams is fine for four languages and not for seven.
-   Collapse 1-8 into one `LangSpec` dataclass (extensions, grammar loader,
-   SPEC, DECISIONS, decl scopes, callable kinds, platform names, dep probes)
-   and let `store.py` ask the registry instead of `if fam == "java"`. Do this
-   before Rust, not after: three languages added one at a time to a dict and
-   three if-chains is how the resolver becomes unreviewable.
+1. **Registry.** Done: nine seams collapsed into one `LangSpec` record per
+   language, and `store.py` asks the record instead of `if fam == "java"`.
+   `ken langs` is the gate — a record is finished when it reports `ok`.
+   Everything after this step is a table plus a record, which is why it went
+   first: three languages added one at a time to a dict and three if-chains is
+   how the resolver becomes unreviewable.
 2. **Rust.** SPEC table, `impl`/`trait` parenting, `mod`/`use` dep probing,
    prelude name set. Expect the smallest amount of new engine code and the most
    new table code. The `tree-sitter-rust` dependency goes into `pyproject.toml`
