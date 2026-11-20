@@ -16,5 +16,5 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: uv pip install --system -e . pytest
+      - run: uv pip install -e . pytest
       - run: python -m pytest -q
