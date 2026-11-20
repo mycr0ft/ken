@@ -57,6 +57,13 @@ def test_declaration_vs_definition(db):
     assert "Shape::scale" in out
 
 
+def test_graph_down_and_dot(db):
+    out = run(db, "graph", "main", "--depth", "2")
+    assert "Shape::scale" in out and "edges" in out
+    dot = run(db, "graph", "main", "--dot")
+    assert dot.startswith("digraph ken {") and "->" in dot
+
+
 def test_fts_find(db):
     out = run(db, "find", "scale")
     assert "Shape::scale" in out

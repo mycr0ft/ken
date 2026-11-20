@@ -110,6 +110,79 @@ def cmd_find(a) -> None:
     print(f"{len(rows)} matches")
 
 
+def cmd_graph(a) -> None:
+    """Call graph around a symbol, as an indented tree or Graphviz DOT."""
+    con = store.connect(a.db)
+    roots = [r[0] for r in _entity_ids(con, a.name)]
+    if not roots:
+        print(f"no entity named {a.name}")
+        return
+    up = a.direction in ("up", "both")
+    down = a.direction in ("down", "both")
+
+    def neighbours(eid):
+        out = []
+        if down:
+            out += con.execute(
+                "SELECT tgt.id,tgt.qualname FROM refs r JOIN entities tgt ON tgt.id=r.target_id "
+                "WHERE r.src_entity=? AND r.kind IN ('call','instantiate','inherit') "
+                "GROUP BY tgt.id", (eid,)).fetchall()
+        if up:
+            out += con.execute(
+                "SELECT src.id,COALESCE(src.qualname,'(file scope)') FROM refs r "
+                "JOIN entities src ON src.id=r.src_entity "
+                "WHERE r.target_id=? AND r.kind IN ('call','instantiate') "
+                "GROUP BY src.id", (eid,)).fetchall()
+        return out
+
+    edges, order = set(), []
+    frontier = [(rid, 0) for rid in roots]
+    seen = set(roots)
+    while frontier:
+        eid, depth = frontier.pop(0)
+        if depth >= a.depth:
+            continue
+        for nid, nqual in neighbours(eid):
+            if nid is None:
+                continue
+            edges.add((eid, nid))
+            if nid not in seen:
+                seen.add(nid)
+                order.append((nid, nqual))
+                frontier.append((nid, depth + 1))
+    names = {eid: q for eid, q in con.execute(
+        f"SELECT id,qualname FROM entities WHERE id IN ({','.join('?' * len(seen))})",
+        list(seen))} if seen else {}
+    if a.direction == "up":
+        edges = {(tgt, src) for src, tgt in edges}
+    if a.dot:
+        print("digraph ken {")
+        print('  rankdir=LR; node [shape=box, fontname="Helvetica", fontsize=10];')
+        for eid, q in names.items():
+            style = ' style=filled, fillcolor="#eef"' if eid in set(roots) else ""
+            print(f'  n{eid} [label="{q}"{style}];')
+        for s, d in sorted(edges):
+            print(f"  n{s} -> n{d};")
+        print("}")
+        return
+    adj = {}
+    for s, d in edges:
+        adj.setdefault(s, []).append(d)
+    printed = set()
+
+    def walk(eid, depth):
+        pad = "  " * depth
+        for nid in sorted(set(adj.get(eid, [])), key=lambda x: names.get(x, "")):
+            print(f"{pad}{names.get(nid, '?')}")
+            if nid not in printed and depth + 1 < a.depth:
+                printed.add(nid)
+                walk(nid, depth + 1)
+    for rid in roots:
+        print(names.get(rid, a.name))
+        walk(rid, 1)
+    print(f"{len(edges)} edges, {len(seen)} nodes")
+
+
 def cmd_callers(a) -> None:
     con = store.connect(a.db)
     ids = [r[0] for r in _entity_ids(con, a.name)]
@@ -203,6 +276,13 @@ def main(argv=None) -> None:
     s.add_argument("pattern")
     s.add_argument("--limit", type=int, default=60)
     s.set_defaults(fn=cmd_sym)
+
+    s = sub.add_parser("graph", help="call graph around a symbol")
+    s.add_argument("name")
+    s.add_argument("--direction", choices=("up", "down", "both"), default="down")
+    s.add_argument("--depth", type=int, default=2)
+    s.add_argument("--dot", action="store_true", help="emit Graphviz DOT")
+    s.set_defaults(fn=cmd_graph)
 
     s = sub.add_parser("find", help="token search over the symbol index")
     s.add_argument("text")
