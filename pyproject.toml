@@ -1,12 +1,27 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "ken"
 version = "0.1.0"
 description = "Multi-language code comprehension: entities, references and metrics for C, C++, Python and Java"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+keywords = ["code-comprehension", "static-analysis", "tree-sitter", "call-graph", "sqlite", "ctags"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C",
+  "Programming Language :: C++",
+  "Programming Language :: Java",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Software Development :: Quality Assurance",
+  "Environment :: Console",
+]
 dependencies = [
   "tree-sitter>=0.26",
   "tree-sitter-c",
@@ -14,6 +29,10 @@ dependencies = [
   "tree-sitter-python",
   "tree-sitter-java",
 ]
+
+[project.urls]
+Repository = "https://github.com/mycr0ft/ken"
+Issues = "https://github.com/mycr0ft/ken/issues"
 
 [project.scripts]
 ken = "ken.cli:main"

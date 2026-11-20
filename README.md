@@ -111,3 +111,10 @@ and a clang-based C/C++ front end. Commercial Understand (SciTools) is the
 feature benchmark. SCIP/LSIF and Glean solve the same problem by consuming real
 compiler output; `ken` deliberately trades precision for a single-command
 install that works on any tree.
+
+## License
+
+Mozilla Public License 2.0. File-level copyleft: you may link `ken` into
+anything, including proprietary tools, but modifications to `ken`'s own files
+stay under the MPL. See `LICENSE` for the full text; each source file carries
+the short notice.
