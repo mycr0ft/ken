@@ -44,13 +44,24 @@ def connect_ro(db: str) -> sqlite3.Connection:
     return con
 
 
+def _dicts(cur):
+    """Rows as dicts whether or not the caller asked for sqlite3.Row.
+
+    The handlers are also called straight from tests and from other modules
+    with a plain connection, so they must not depend on connect_ro() having
+    set row_factory.
+    """
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
 def _rows(con, sql, args=()):
-    return [dict(r) for r in con.execute(sql, args).fetchall()]
+    return _dicts(con.execute(sql, args))
 
 
 def _one(con, sql, args=()):
-    r = con.execute(sql, args).fetchone()
-    return dict(r) if r else None
+    rows = _dicts(con.execute(sql, args))
+    return rows[0] if rows else None
 
 
 def _count(con, sql, args=()) -> int:
@@ -577,6 +588,164 @@ def api_metrics(con, params):
                 ORDER BY refs DESC""")}
 
 
+MAX_PACKAGES = 60
+
+
+def _dir_of(path: str, root: str) -> str:
+    p = path[len(root):].lstrip("/") if root and path.startswith(root) else path
+    return p.rsplit("/", 1)[0] if "/" in p else "."
+
+
+def api_packages(con, params):
+    """UML package diagram: directories as packages, file dependencies as
+    «import»/«use» arrows between them.
+
+    Packages are the unit people actually reason about in an unfamiliar tree
+    ("what does this directory lean on?"), and unlike a class diagram they fit
+    on one canvas: a 200-file corpus usually has a few dozen directories.
+    """
+    root = _corpus_root(con)
+    want = min(max(_int((params.get("limit") or [str(MAX_PACKAGES)])[0], MAX_PACKAGES), 6),
+               MAX_PACKAGES)
+    files = _rows(con, "SELECT id, path, lang, loc FROM files")
+    pkgs, file_pkg = {}, {}
+    for f in files:
+        d = _dir_of(f["path"], root)
+        file_pkg[f["id"]] = d
+        p = pkgs.setdefault(d, {"id": d, "name": d.rsplit("/", 1)[-1], "path": d,
+                                "files": 0, "loc": 0, "langs": {}})
+        p["files"] += 1
+        p["loc"] += _int(f["loc"])
+        p["langs"][f["lang"]] = p["langs"].get(f["lang"], 0) + 1
+    classes = {}
+    for r in con.execute(
+            "SELECT f.path, COUNT(*) FROM entities e JOIN files f ON f.id = e.file_id"
+            " WHERE e.kind IN ('class','interface','struct','enum') GROUP BY f.path"):
+        classes[_dir_of(r[0], root)] = r[1]
+    for k, v in pkgs.items():
+        v["classes"] = classes.get(k, 0)
+    ranked = sorted(pkgs.values(), key=lambda p: (-p["files"], -p["loc"], p["name"]))
+    keep = {p["id"] for p in ranked[:want]}
+    edges = {}
+    for src, dst, kind, n in con.execute(
+            "SELECT src_file, dst_file, kind, COUNT(*) FROM file_deps GROUP BY 1,2,3"):
+        a, b = file_pkg.get(src), file_pkg.get(dst)
+        if not a or not b or a == b or a not in keep or b not in keep:
+            continue
+        e = edges.setdefault((a, b), {"s": a, "d": b, "imports": 0, "uses": 0})
+        if kind == "import":
+            e["imports"] += n
+        else:
+            e["uses"] += n
+    return {"root": root, "limit": want, "total_packages": len(pkgs),
+            "packages": [p for p in ranked if p["id"] in keep],
+            "edges": sorted(edges.values(), key=lambda e: -(e["imports"] + e["uses"])),
+            "omitted": max(0, len(pkgs) - len(keep))}
+
+
+MAX_SEQ_MESSAGES = 40
+
+
+def _owner_of(con, eid: int, cache: dict):
+    """The class (or, failing that, the file) that owns an operation."""
+    chain, cur = [], eid
+    while cur is not None and len(chain) < 12:
+        if cur in cache:
+            return cache[cur]
+        row = _one(con, "SELECT id, name, kind, parent_id, file_id FROM entities WHERE id=?",
+                   (cur,))
+        if row is None:
+            break
+        chain.append(row)
+        cur = row["parent_id"]
+    owner = None
+    for r in reversed(chain):
+        if _is_class(r["kind"]):
+            owner = ("c", r["id"], r["name"])
+            break
+    if owner is None and chain:
+        f = _one(con, "SELECT id, path, lang FROM files WHERE id=?", (chain[0]["file_id"],))
+        if f:
+            owner = ("f", f["id"], f["path"].rsplit("/", 1)[-1])
+    if owner:
+        for r in chain:
+            cache[r["id"]] = owner
+    return owner
+
+
+def api_sequence(con, params):
+    """UML sequence diagram for one operation: the messages it sends, in source
+    order, between the objects that own them.
+
+    The ordering is the point. A call graph says which functions are connected;
+    a sequence diagram says what happens first, which is what a reader needs to
+    understand a 40-line method.
+    """
+    eid = _int((params.get("id") or ["0"])[0])
+    limit = min(max(_int((params.get("limit") or ["18"])[0], 18), 4), MAX_SEQ_MESSAGES)
+    ent = _one(con, """SELECT e.id, e.name, e.qualname, e.kind, e.line, e.end_line,
+                              e.complexity, e.file_id, f.path, f.lang
+                         FROM entities e JOIN files f ON f.id = e.file_id
+                        WHERE e.id = ?""", (eid,))
+    if not ent:
+        return None
+    cache = {}
+    origin = _owner_of(con, eid, cache)
+    if origin is None:
+        f = _one(con, "SELECT id, path FROM files WHERE id=?", (ent["file_id"],)) or {}
+        origin = ("f", f.get("id"), (f.get("path") or ent["path"]).rsplit("/", 1)[-1])
+    # depth 1 = the operation's own messages only; each further level follows a
+    # cross-object call into that object's code
+    depth_max = min(max(_int((params.get("depth") or ["2"])[0], 2), 1), 4)
+    msgs = []
+    lifelines = {origin[1]: {"id": origin[1], "label": origin[2], "kind": origin[0]}}
+    # Depth-first in call-site order: that is the order a reader follows the
+    # code, and it keeps consecutive messages from the same object together.
+    # Only cross-object hops are drawn; a method calling its own class's
+    # helpers is one row of code, not an interaction.
+    stack, done, sites, clipped = [(eid, 0)], set(), 0, False
+    while stack and len(msgs) < limit:
+        cur, depth = stack.pop(0)
+        if cur in done:
+            continue
+        done.add(cur)
+        src_owner = _owner_of(con, cur, cache) or origin
+        for c in _rows(con, """SELECT r.line, r.kind, r.target, r.target_id
+                                FROM refs r
+                               WHERE r.src_entity = ? AND r.kind IN ('call','instantiate')
+                            ORDER BY r.line""", (cur,)):
+            sites += 1
+            if not c["target_id"]:
+                continue
+            tgt = _owner_of(con, c["target_id"], cache)
+            if tgt is None:
+                continue
+            same = tgt[1] == src_owner[1]
+            lifelines.setdefault(tgt[1], {"id": tgt[1], "label": tgt[2], "kind": tgt[0]})
+            msgs.append({"n": len(msgs) + 1, "s": src_owner[1], "d": tgt[1],
+                         "label": c["target"] or tgt[2], "line": c["line"],
+                         "kind": c["kind"], "depth": depth, "self": same})
+            if not same and depth + 1 < depth_max:
+                stack.append((c["target_id"], depth + 1))
+            if len(msgs) >= limit:
+                clipped = True
+                break
+    # the wire speaks lifeline indices, so map entity ids onto positions and
+    # count traffic per lifeline (in/out kept apart: a pure caller is not idle)
+    rows = list(lifelines.values())
+    seen_ids = [r["id"] for r in rows]
+    index = {eid: i for i, eid in enumerate(seen_ids)}
+    for m in msgs:
+        m["s"], m["d"] = index[m["s"]], index[m["d"]]
+    for i, r in enumerate(rows):
+        r["in"] = sum(1 for m in msgs if m["d"] == i)
+        r["out"] = sum(1 for m in msgs if m["s"] == i and m["s"] != m["d"])
+    return {"entity": ent, "origin": origin[1], "messages": msgs,
+            "lifelines": rows, "depth": depth_max,
+            "total_calls": sites, "limit": limit,
+            "truncated": clipped or bool(stack)}
+
+
 ROUTES = {
     "/api/overview": api_overview,
     "/api/search": api_search,
@@ -586,6 +755,8 @@ ROUTES = {
     "/api/graph": api_graph,
     "/api/metrics": api_metrics,
     "/api/uml": api_uml,
+    "/api/packages": api_packages,
+    "/api/sequence": api_sequence,
 }
 
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",

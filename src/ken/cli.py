@@ -264,6 +264,23 @@ def cmd_metrics(a) -> None:
         print(f"  {n:>4}x {qual}")
 
 
+def cmd_sysml(a) -> None:
+    from .sysml import emit
+    con = store.connect(a.db)
+    text, st = emit(con, scope=a.scope, max_classes=a.max_classes)
+    if a.out and a.out != "-":
+        with open(a.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        where = a.out
+    else:
+        sys.stdout.write(text)
+        where = "stdout"
+    print(f"{st['emitted']}/{st['classes']} classes, {st['generalizations']} specializations, "
+          f"{st['dependencies']} dependencies -> {where} "
+          f"({len(text)} bytes{', truncated ' + str(st['truncated']) if st['truncated'] else ''})",
+          file=sys.stderr)
+
+
 def cmd_web(a) -> None:
     from .web.server import serve
 
@@ -316,6 +333,12 @@ def main(argv=None) -> None:
     s = sub.add_parser("metrics")
     s.add_argument("--top", type=int, default=15)
     s.set_defaults(fn=cmd_metrics)
+
+    s = sub.add_parser("sysml", help="project the index to a SysML v2 model")
+    s.add_argument("--scope", default=None, help="directory subtree to project (default: whole index)")
+    s.add_argument("--out", default="-", help="write here instead of stdout")
+    s.add_argument("--max-classes", dest="max_classes", type=int, default=4000)
+    s.set_defaults(fn=cmd_sysml)
 
     s = sub.add_parser("web", help="serve the read-only browser front end")
     s.add_argument("--port", type=int, default=8000)

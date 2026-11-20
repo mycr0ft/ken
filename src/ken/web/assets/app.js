@@ -454,7 +454,8 @@ async function viewSymbol(host, params, id) {
         <!-- the two lists that make a symbol page navigable sit beside the code,
              not under 800px of it -->
         <section>
-          <h2>Calls<span class="c mono">${calls.length}</span></h2>
+          <h2>Calls<span class="c mono">${calls.length}</span>
+            <a class="dkind" href="#/seq/${e.id}" title="sequence diagram from this method">sequence →</a></h2>
           <div class="list">${calls.map((r) => {
             const meta = [r.target_path ? shortPath(r.target_path, d.root) + (r.target_line ? ':' + r.target_line : '') : '',
               RES_LABEL[r.resolution] || r.resolution || '—', r.n > 1 ? '×' + n(r.n) : ''].filter(Boolean).join(' · ');
@@ -799,7 +800,8 @@ async function viewUml(host, params) {
   host.innerHTML = `<div class="wrap wide">
     <div class="graphhead">
       <div>
-        <div class="crumb mono dim" style="font-size:11px;margin-bottom:6px">CLASS DIAGRAM</div>
+        <div class="crumb mono dim" style="font-size:11px;margin-bottom:6px">CLASS DIAGRAM
+          <a class="dkind" href="#/packages">packages →</a></div>
         <h1 style="font-size:17px">${path ? esc(path) : 'Whole index'}</h1>
       </div>
       <span class="sp" style="margin-left:auto"></span>
@@ -1181,8 +1183,219 @@ async function viewSearch(host, params) {
   });
 }
 
+
+// ------------------------------------------------------------------ packages
+async function viewPackages(host) {
+  const d = await api('/api/packages', { limit: 60 });
+  document.title = 'packages · ken';
+  const shown = d.packages.length;
+  host.innerHTML = `<div class="wrap wide">
+    <div class="graphhead">
+      <div class="crumb">PACKAGE DIAGRAM <a class="dkind" href="#/uml">← classes</a></div>
+      <div class="sub">${shown} of ${d.total_packages} packages${d.omitted ? ` · ${d.omitted} left out` : ''}</div>
+      <div class="overlay right"><span class="ue-key"><svg width="26" height="10"><line x1="1" y1="5" x2="25" y2="5" class="ue-line"/></svg>«use»</span>
+        <span class="ue-key"><svg width="26" height="10"><line x1="1" y1="5" x2="25" y2="5" class="ue-line dash"/></svg>«import»</span></div>
+    </div>
+    <div class="graphbox seqbox"><svg class="pkgscene"></svg></div>
+    <p class="dim" style="font-size:11.5px;margin-top:10px">
+      A dependency means a file in the source package names something defined in the target package.
+      «import» is a resolved include or import; «use» is any other cross-package reference.
+    </p>
+  </div>`;
+  drawPackages($('.pkgscene', host), d);
+}
+
+function sceneSize(svg, W, H) {
+  // a four-message trace should not be blown up to fill 800 px; draw it at
+  // its own size and only scale down when the scene is genuinely larger
+  const box = svg.parentElement.getBoundingClientRect();
+  const fit = W > box.width - 2 || H > box.height - 2;
+  svg.style.width = fit ? '100%' : Math.round(W) + 'px';
+  svg.style.height = fit ? '100%' : Math.round(H) + 'px';
+}
+
+function drawPackages(svg, d) {
+  const BW = 196, BH = 46, GAPX = 40, GAPY = 34, ASPECT = 1.86;
+  const nodes = d.packages;
+  const byId = new Map(nodes.map((p) => [p.id, p]));
+  const edges = d.edges.filter((e) => byId.has(e.s) && byId.has(e.d));
+  // layer by longest dependency path, so a package sits below the things it
+  // uses; cycles are broken at their first back edge
+  const out = new Map(nodes.map((p) => [p.id, []]));
+  const indeg = new Map(nodes.map((p) => [p.id, 0]));
+  edges.forEach((e) => { out.get(e.s).push(e.d); indeg.set(e.d, indeg.get(e.d) + 1); });
+  const layer = new Map(nodes.map((p) => [p.id, 0]));
+  const q = nodes.filter((p) => indeg.get(p.id) === 0).map((p) => p.id);
+  const touched = new Set(q);
+  while (q.length) {
+    const id = q.shift();
+    for (const t of out.get(id)) {
+      layer.set(t, Math.max(layer.get(t), layer.get(id) + 1));
+      indeg.set(t, indeg.get(t) - 1);
+      if (indeg.get(t) === 0 && !touched.has(t)) { touched.add(t); q.push(t); }
+    }
+  }
+  const order = nodes.slice().sort((a, b) =>
+    (layer.get(a.id) - layer.get(b.id)) || (b.files - a.files) || a.path.localeCompare(b.path));
+  // pick the column count whose canvas comes closest to the box's aspect
+  let nCols = 1, best = Infinity;
+  for (let k = 1; k <= Math.min(8, nodes.length); k++) {
+    const rows = Math.ceil(nodes.length / k);
+    const w = k * BW + (k - 1) * GAPX, h = rows * BH + (rows - 1) * GAPY;
+    const score = Math.abs(Math.log((w / h) / ASPECT));
+    if (score < best) { best = score; nCols = k; }
+  }
+  const pos = new Map();
+  order.forEach((p, i) => {
+    const r = Math.floor(i / nCols), col = i % nCols;
+    const inRow = Math.min(nCols, nodes.length - r * nCols);
+    const w = inRow * BW + (inRow - 1) * GAPX;
+    pos.set(p.id, { x: -w / 2 + col * (BW + GAPX), y: r * (BH + GAPY) });
+  });
+  const edgeD = edges.map((e) => {
+    const a = pos.get(e.s), b = pos.get(e.d);
+    const ac = { x: a.x + BW / 2, y: a.y + BH / 2 }, bc = { x: b.x + BW / 2, y: b.y + BH / 2 };
+    let p1, p2, c1, c2;
+    const sameRow = Math.abs(a.y - b.y) < 1;
+    if (sameRow) {
+      const right = bc.x > ac.x;
+      p1 = { x: right ? a.x + BW : a.x, y: ac.y };
+      p2 = { x: right ? b.x : b.x + BW, y: bc.y };
+      const mx = (p1.x + p2.x) / 2;
+      c1 = { x: mx, y: p1.y }; c2 = { x: mx, y: p2.y };
+    } else {
+      const down = bc.y > ac.y;
+      p1 = { x: ac.x, y: down ? a.y + BH : a.y };
+      p2 = { x: bc.x, y: down ? b.y : b.y + BH };
+      const my = (p1.y + p2.y) / 2;
+      c1 = { x: p1.x, y: my }; c2 = { x: p2.x, y: my };
+    }
+    const dash = e.imports > e.uses ? ' dash' : '';
+    // a dependency is directed; without a head the layered layout reads as a mesh
+    const ang = Math.atan2(p2.y - c2.y, p2.x - c2.x);
+    const ux = Math.cos(ang), uy = Math.sin(ang);
+    const head = `${p2.x},${p2.y} ${p2.x - ux * 7 + uy * 3.4},${p2.y - uy * 7 - ux * 3.4} ${p2.x - ux * 7 - uy * 3.4},${p2.y - uy * 7 + ux * 3.4}`;
+    return `<path class="uedge${dash}" d="M${p1.x} ${p1.y} C${c1.x} ${c1.y} ${c2.x} ${c2.y} ${p2.x} ${p2.y}"/><polygon class="uehead" points="${head}"/>`;
+  }).join('');
+  const label = (p) => {
+    const parts = String(p.path).split('/').filter((s) => s && s !== '.');
+    const t = parts.length > 1 ? parts.slice(-2).join('/') : (parts[0] || p.name);
+    return t.length > 22 ? '…' + t.slice(-21) : t;
+  };
+  const boxD = nodes.map((p) => {
+    const o = pos.get(p.id);
+    return `<g class="umlcls pkg" data-path="${esc(p.path)}" transform="translate(${o.x} ${o.y})">
+      <rect class="body" width="${BW}" height="${BH}"/>
+      <path class="tab" d="M0 0 v-8 h34 l7 8 z"/>
+      <text x="9" y="19">${esc(label(p))}</text>
+      <text class="n" x="9" y="35">${p.files} files · ${p.classes} types · ${n(p.loc)} loc</text></g>`;
+  }).join('');
+  svg.innerHTML = `<g class="scene">${edgeD}${boxD}</g>`;
+  const bb = svg.firstChild.getBBox();
+  const pad = 24;
+  svg.setAttribute('viewBox', `${bb.x - pad} ${bb.y - pad} ${bb.width + 2 * pad} ${bb.height + 2 * pad}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  svg.style.width = '100%';
+  svg.style.height = '100%';
+  $$('g.pkg', svg).forEach((g) => {
+    g.style.cursor = 'pointer';
+    g.onclick = () => { location.hash = `#/files?path=${encodeURIComponent(g.dataset.path)}`; };
+  });
+}
+
+// ------------------------------------------------------------------ sequence
+async function viewSequence(host, eid) {
+  const d = await api('/api/sequence', { id: eid, limit: 24, depth: 2 });
+  if (!d) throw new Error('no such symbol');
+  const e = d.entity;
+  document.title = `${e.name} · sequence · ken`;
+  host.innerHTML = `<div class="wrap wide">
+    <div class="graphhead">
+      <div class="crumb">SEQUENCE DIAGRAM</div>
+      <div class="h1line"><a class="sym" href="#/sym/${e.id}">${esc(e.qualname || e.name)}</a>
+        <span class="dim mono" style="font-size:11px">${esc(shortPath(e.path))}:${e.line}</span></div>
+      <div class="sub">${d.messages.length} messages · ${d.lifelines.length} lifelines · depth ${d.depth}${d.truncated ? ' · truncated' : ''}</div>
+    </div>
+    <div class="graphbox seqbox"><svg class="seqscene"></svg></div>
+    <p class="dim" style="font-size:11.5px;margin-top:10px">
+      Messages follow call-site order, not runtime order: loops and branches make the two differ.
+      Calls into the caller's own class are drawn as self-messages. ${n(d.total_calls)} call sites were examined.
+    </p>
+  </div>`;
+  drawSequence($('.seqscene', host), d);
+}
+
+function drawSequence(svg, d) {
+  const TOP = 54, ROW = 30, HEAD = 40;
+  const lives = d.lifelines;
+  // spread lifelines across the box when there are only a few of them, but
+  // never squeeze below the width at which a message label stops fitting
+  const boxW = (svg.parentElement ? svg.parentElement.clientWidth : 720) - 40;
+  const COL = lives.length > 1
+    ? Math.max(172, Math.min(240, Math.floor((boxW - 60) / (lives.length - 1))))
+    : 172;
+  const W = Math.max((lives.length - 1) * COL + 120, 360);
+  const H = TOP + HEAD + d.messages.length * ROW + 46;
+  const cx = (i) => 60 + i * COL;  // first lifeline sits 60 px in, so the left margin is shared
+  const parts = [];
+  lives.forEach((l, i) => {
+    parts.push(`<g class="seqhead" data-id="${l.id}" data-kind="${l.kind}" transform="translate(${cx(i) - 62} ${TOP})">
+      <rect width="124" height="${HEAD}" rx="3"/>
+      <text x="62" y="17" text-anchor="middle">${esc(l.label.length > 20 ? l.label.slice(0, 19) + '…' : l.label)}</text>
+      <text class="n" x="62" y="31" text-anchor="middle">${l.in} in · ${l.out} out</text></g>`);
+    parts.push(`<line class="lifeline" x1="${cx(i)}" y1="${TOP + HEAD}" x2="${cx(i)}" y2="${H - 20}"/>`);
+  });
+  d.messages.forEach((m, i) => {
+    const y = TOP + HEAD + 34 + i * ROW;
+    const a = m.s, b = m.d;  // s/d arrive as lifeline indices, not entity ids
+    const self = m.self || a === b;
+    // «create» is the UML stereotype for construction. A construction arrives
+    // as kind 'call' on a class lifeline whose label is the class itself, since
+    // most languages have no separate instantiation syntax.
+    const dl = lives[b] || {};
+    const create = dl.kind === 'c' && m.label === dl.label;
+    const label = `${m.n}. ${create ? '«create» ' : ''}${m.label}`;
+    if (self) {
+      const x = cx(a) + 8;
+      parts.push(`<path class="msg" d="M${x} ${y} h38 v16 h-38"/>
+        <polygon class="msghead" points="${x},${y + 16} ${x + 8},${y + 12} ${x},${y + 8}"/>
+        <text class="mlabel" x="${x + 48}" y="${y + 12}">${esc(label)}</text>`);
+    } else {
+      const x1 = cx(a), x2 = cx(b);
+      const dir = x2 > x1 ? 1 : -1;
+      parts.push(`<line class="msg" x1="${x1}" y1="${y}" x2="${x2 - dir * 6}" y2="${y}"/>
+        <polygon class="msghead" points="${x2},${y} ${x2 - dir * 9},${y - 4} ${x2 - dir * 9},${y + 4}"/>
+        <text class="mlabel" x="${(x1 + x2) / 2}" y="${y - 6}" text-anchor="middle">${esc(label)}</text>`);
+    }
+  });
+  // one activation bar per lifeline spanning the rows it takes part in, the
+  // way a UML sequence diagram shows a live call, instead of a tick per arrow
+  const span = new Map();
+  d.messages.forEach((m, i) => {
+    const y = TOP + HEAD + 34 + i * ROW;
+    for (const who of [m.s, m.d]) {
+      const cur = span.get(who);
+      span.set(who, cur ? [Math.min(cur[0], y), Math.max(cur[1], y)] : [y, y]);
+    }
+  });
+  for (const [who, [y0, y1]] of span) {
+    parts.push(`<rect class="act" x="${cx(who) - 5}" y="${y0 - 8}" width="10" height="${Math.max(y1 - y0 + 16, 16)}" rx="1"/>`);
+  }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  // sequence diagrams are read line by line, so keep labels at their real
+  // size and let the box scroll rather than shrinking 10 px text to 7 px
+  svg.style.width = Math.round(W) + 'px';
+  svg.style.height = Math.round(H) + 'px';
+  svg.innerHTML = `<g class="scene">${parts.join('')}</g>`;
+  $$('g.seqhead', svg).forEach((g) => {
+    g.style.cursor = 'pointer';
+    g.onclick = () => { location.hash = g.dataset.kind === 'c' ? `#/sym/${g.dataset.id}` : `#/file/${g.dataset.id}`; };
+  });
+}
+
 // ---------------------------------------------------------------- router
-const NAV = { '': 'overview', files: 'files', file: 'files', metrics: 'metrics', uml: 'uml' };
+const NAV = { '': 'overview', files: 'files', file: 'files', metrics: 'metrics', uml: 'uml', packages: 'packages', seq: 'uml' };
 
 async function render() {
   const raw = location.hash.replace(/^#/, '') || '/';
@@ -1201,6 +1414,8 @@ async function render() {
     else if (name === 'graph') {
       await viewGraph(host, params, Number(seg[1]));
     } else if (name === 'uml') await viewUml(host, params);
+    else if (name === 'packages') await viewPackages(host);
+    else if (name === 'seq') await viewSequence(host, Number(seg[1]));
     else if (name === 'metrics') await viewMetrics(host, params);
     else if (name === 'search') await viewSearch(host, params);
     else host.innerHTML = `<div class="wrap"><div class="err">No route for ${esc(raw)}</div></div>`;

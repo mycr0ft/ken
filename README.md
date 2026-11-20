@@ -108,14 +108,57 @@ DB-derived and re-reads on navigation:
 | `#/sym/<id>` | one symbol: declaration site, children, calls in and out, references |
 | `#/graph/<id>?dir=up\|down&depth=` | call graph, bucketed by file so 200 edges stay readable |
 | `#/uml?path=&limit=` | class diagram: packages as panels, inheritance solid, use dashed |
+| `#/packages` | package diagram: one box per directory, arrows for cross-package dependencies |
+| `#/seq/<id>` | sequence diagram: an interaction trace out of one operation, one lifeline per class |
 | `#/search?q=&in=symbols\|files` | full-text search over names, qualified names, and paths |
 
 Two things worth knowing about the diagrams. The class diagram selects a
 *connected* neighbourhood by breadth-first walk from the structurally busiest
 classes, capped per file, per directory, and per class name: a generated
 parser's three hundred sibling context classes would otherwise take every slot.
-And the call graph buckets by file rather than drawing one node per symbol,
+and the call graph buckets by file rather than drawing one node per symbol,
 because a two-hundred-node graph is a hairball at any zoom level.
+
+The three diagram views cross-link the way an IDE's do: a package box opens its
+files, a package panel's title opens the package diagram, and a method's calls
+heading opens that method's sequence diagram. Each one is a different question
+over the same index, not a different model:
+
+* **Class** - `entities` of class-like kind, `inherit` refs as generalizations,
+  `call`/`instantiate` refs rolled up through `parent_id` as associations.
+* **Package** - one box per directory (`files.path`, cut at the corpus root),
+  one arrow per `file_deps` row that crosses two directories. Boxes are layered
+  by longest dependency path, so a package sits below the packages it uses.
+  Directory granularity, not file granularity: a few dozen boxes fit on one
+  canvas, five hundred do not.
+* **Sequence** - a depth-limited walk from one operation. Lifelines are the
+  classes that own the called methods (or the file, when a call leaves a class),
+  messages are the `call`/`instantiate` refs in call-site order. Calls into the
+  caller's own class are marked `self` and drawn as a loop rather than expanded,
+  which keeps helper calls from turning the diagram into a tree.
+
+The sequence view keeps its natural size and scrolls instead of scaling to the
+box: 10 px labels shrunk to 7 px are worse than a scrollbar.
+
+## Export the model as SysML v2
+
+`ken sysml` projects the index into a SysML v2 package tree, for interchange
+with MBSE tooling. It is an output format only: the index stays relational, and
+nothing reads SysML back into `ken`.
+
+    ken --db code.db sysml --scope src/sysmlpy --out model.sysml --max-classes 400
+
+| ken | SysML v2 |
+| --- | --- |
+| directory | `package`, nested to match the path |
+| class / struct / interface / enum | `part def`, with `loc` and `complexity` as `attribute`s |
+| `inherit` ref | `specializes` |
+| `call` / `instantiate` ref, rolled up to the calling class | `dependency ... from A to B` |
+
+The output is checked, not asserted: it is expected to load without syntax
+errors and to produce exactly one `part def` per emitted class. Names are made
+unique per package (`Name_2`) rather than dropping classes on collision, and
+`--max-classes` reports what it omitted instead of silently truncating.
 
 ## Limits, honestly
 
