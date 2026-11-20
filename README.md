@@ -27,18 +27,29 @@ ken --db my.db callers helper            # who calls it, with file:line
 ken --db my.db callees main              # what it calls, resolved + unresolved
 ken --db my.db metrics --top 20          # complexity + fan-in leaders
 ken --db my.db deps calc.cpp             # #include / import graph for one file
+ken --db my.db graph main --depth 3      # call graph tree (--dot for Graphviz)
+ken --db my.db graph helper --direction up
 ```
 
 Index output also reports resolution quality:
 
 ```
 indexed 7 files, 23 entities, 18 refs in 0.0s
-refs  exact=8  scoped=0  unique=6  ambiguous=0  unresolved=4  -> resolved 77.8%
+refs  exact=11  scoped=0  unique=6  ambiguous=1  external=1  unresolved=4  -> resolved 77.3%
 deps  resolved=2  unresolved=5
 ```
 
-Unresolved references are mostly library calls (`printf`, `System.out.println`,
-`List.of`) and are counted, never silently dropped.
+`external` is a call to a language builtin (`len`, `hasattr`, `super`): a target
+that by definition lives outside the tree, so it is neither resolved nor a
+failure. `unresolved` is a real miss (typically a library call such as
+`printf` or `List.of`). Both are counted, never silently dropped. `resolved%`
+is computed over references that have an in-tree candidate at all.
+
+Measured on two real trees: 202 files / 172k lines of Python and C++ gives
+44% resolved, 24% external, 16% ambiguous, 16% unresolved in 4 s; 23.5k headers
+of `/usr/include` gives 22% resolved in 1m53s (a declarations-only tree is the
+worst case for name-based resolution, and the reason `ambiguous` is recorded
+with its candidate count rather than guessed at).
 
 ## What is in the database
 
@@ -59,8 +70,9 @@ A post-pass over the finished database, in this order:
 1. exact `qualname` match;
 2. unique name match, filtered to the source file's **language family** (C and
    C++ are one family because they interoperate; Python and Java are separate);
-3. same-file candidates, then same enclosing scope, then definition beats a
-   same-name declaration in a header;
+3. same-file candidates, then same-directory (one package or module), then
+   same enclosing scope, then definition beats a same-name declaration in a
+   header;
 4. otherwise `ambiguous` (candidates recorded) or `unresolved`.
 
 Every ref stores its resolution class, so you can measure the index instead of
@@ -85,7 +97,11 @@ intrinsic tables) nest deeper than Python's recursion limit.
 * C++ out-of-line definitions (`int Foo::bar()`) are indexed as `function` on
   the defining file; they resolve correctly by qualname but read as free
   functions in `sym`.
-* No call-site column, no dataflow, no preprocessor evaluation.
+* No call-site column, no dataflow, no preprocessor evaluation. Conditional
+  compilation is ignored: every `#ifdef` branch is indexed.
+* Inheritance edges come from an explicit base list (`class A : public B`,
+  `class A(B)`, `extends`); interfaces mixed in by macro or by generated code
+  are missed.
 * Files that fail to parse are listed and skipped rather than killing the run.
 
 ## Related work

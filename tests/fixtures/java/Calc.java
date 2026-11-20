@@ -11,6 +11,10 @@ public class Calc {
         return x;
     }
 
+    static class Circle extends Calc {
+        double circumference(int r) { return 2 * 3.14159 * r; }
+    }
+
     public static void main(String[] args) {
         List<Integer> xs = List.of(1, 2);
         int t = helper(3);

@@ -54,7 +54,7 @@ def cmd_index(a) -> None:
     rs = store.resolve_refs(con)
     ds = store.resolve_file_deps(con)
     con.commit()
-    total = sum(rs.values())
+    total = sum(rs.values()) - rs["external"]
     print(f"indexed {n_files} files, {n_ent} entities, {n_ref} refs in {parse_s:.1f}s")
     print("refs  " + "  ".join(f"{k}={v}" for k, v in rs.items()) +
           f"  -> resolved {100.0 * (total - rs['unresolved'] - rs['ambiguous']) / max(total, 1):.1f}%")

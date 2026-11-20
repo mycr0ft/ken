@@ -124,6 +124,7 @@ class Builder:
         self.refs: list[dict] = []
         self.deps: list[dict] = []
         self.stack: list[int] = []
+        self._by_node: dict[int, int] = {}   # id(node) -> entity index
 
     # -- entities
     def qual(self, name: str, prefix: str = "") -> str:
@@ -150,7 +151,36 @@ class Builder:
             "complexity": 0,
         }
         self.ents.append(e)
+        self._by_node[id(node)] = len(self.ents) - 1
         return len(self.ents) - 1
+
+    CLASSY = ("class", "struct", "interface", "enum")
+
+    def class_of(self, node):
+        """Index of the nearest enclosing class/struct/interface entity (or None)."""
+        n = node
+        while n is not None:
+            idx = self._by_node.get(id(n))
+            if idx is not None and self.ents[idx]["kind"] in self.CLASSY:
+                return idx
+            n = n.parent
+        # The entity may hang off a child node (a name, or the class_body), so
+        # fall back to the nearest class-ish ancestor's own name.
+        n = node
+        while n is not None:
+            if n.type in ("class_definition", "class_declaration", "class_specifier",
+                          "struct_specifier", "enum_declaration", "interface_declaration"):
+                name = (n.child_by_field_name("name") or n.child_by_field_name("type")) \
+                    if hasattr(n, "child_by_field_name") else None
+                nm = text(self.src, name) if name is not None else ""
+                if nm:
+                    hit = [i for i, e in enumerate(self.ents)
+                           if e["name"] == nm and e["kind"] in self.CLASSY]
+                    if hit:
+                        return hit[-1]
+                break
+            n = n.parent
+        return None
 
     def add_ref(self, kind: str, target: str, line: int, src_idx=None) -> None:
         target = strip_template(target) if target else ""
@@ -377,7 +407,25 @@ def _py_inherits(b: Builder, root) -> None:
                 for c in sup.named_children:
                     if c.type in ("identifier", "attribute"):
                         _, t = name_of(c, src)
-                        b.add_ref("inherit", t, c.start_point[0], b._class_of(n))
+                        b.add_ref("inherit", t, c.start_point[0], b.class_of(n))
+        stack.extend(n.named_children)
+
+
+def _cpp_inherits(b: Builder, root) -> None:
+    """class Square : public Shape -> an inherit edge owned by Square."""
+    src = b.src
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type in ("class_specifier", "struct_specifier"):
+            clause = next((c for c in n.named_children if c.type == "base_class_clause"), None)
+            if clause is not None:
+                owner = b.class_of(n)
+                for c in clause.named_children:
+                    if c.type in ("type_identifier", "qualified_identifier",
+                                  "template_type", "identifier"):
+                        _, nm = name_of(c, src)
+                        b.add_ref("inherit", nm, c.start_point[0], owner)
         stack.extend(n.named_children)
 
 
@@ -395,12 +443,8 @@ def _java_imports(b: Builder, root) -> None:
                 if c.type in ("type_identifier", "scoped_type_identifier", "type_list"):
                     for t in ([c] if c.type != "type_list" else c.named_children):
                         _, nm = name_of(t, src)
-                        b.add_ref("inherit", nm, t.start_point[0])
+                        b.add_ref("inherit", nm, t.start_point[0], b.class_of(t) or b.class_of(n))
         stack.extend(n.named_children)
-
-
-def _class_of(b, node):
-    return None
 
 
 def extract(path: str, lang: str, src: bytes) -> Builder:
@@ -408,13 +452,16 @@ def extract(path: str, lang: str, src: bytes) -> Builder:
     tree = parser.parse(src)
     root = tree.root_node
     b = Builder(path, lang, src)
+    _drive(b, root, SPEC[lang])
+    # imports/inheritance come after the main walk: inherit edges want the
+    # owning class entity to already exist
     if lang == "python":
         _py_imports(b, root)
+        _py_inherits(b, root)
     elif lang == "java":
         _java_imports(b, root)
-    _drive(b, root, SPEC[lang])
-    if lang == "python":
-        _py_inherits(b, root)
+    else:  # c, cpp
+        _cpp_inherits(b, root)
     for e in b.ents:
         if e["kind"] in ("function", "method"):
             e["complexity"] = _complexity(b, e["_node"])

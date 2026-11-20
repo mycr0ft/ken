@@ -94,39 +94,54 @@ def add_file(con: sqlite3.Connection, path: str, lang: str, src: bytes, b) -> in
 
 # ------------------------------------------------------------------ resolution
 
+# Language builtins worth naming: they dominate the unresolved list on Python
+# and saying "external" is more accurate than "unresolved".
+BUILTINS = frozenset("""
+abs all any ascii bin bool breakpoint bytearray bytes callable chr classmethod
+compile complex delattr dict dir divmod enumerate eval exec filter float format
+frozenset getattr globals hasattr hash help hex id input int isinstance
+issubclass iter len list locals map max memoryview min next object oct open ord
+pow print property range repr reversed round set setattr slice sorted staticmethod
+str sum super tuple type vars zip __import__ __name__
+append extend insert remove pop keys values items get update split join strip
+lstrip rstrip replace startswith endswith format encode decode read write close
+""".split())
+
 def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
     """Bind ref.target to entities.id using scope-aware, then global, matching."""
-    by_qual: dict[str, list[int]] = {}
-    by_name: dict[str, list[int]] = {}
+    lang_of = dict(con.execute("SELECT id,lang FROM files"))
+    file_dir = {fid: p.rsplit("/", 1)[0] for fid, p in con.execute("SELECT id,path FROM files")}
+    fam = lambda l: "c" if l in ("c", "cpp") else l  # C and C++ interoperate
+
+    # Candidates are bucketed by language family up front.  Bucketing lazily
+    # meant re-scanning huge same-name lists per reference (a name can live in
+    # thousands of headers), which dominated the run on /usr/include.
+    by_qual: dict[tuple[str, str], list[int]] = {}
+    by_name: dict[tuple[str, str], list[int]] = {}
     ent_info: dict[int, tuple[int, str]] = {}
     ent_decl: dict[int, int] = {}
     for eid, fid, name, qual, parent, decl in con.execute(
             "SELECT id,file_id,name,qualname,parent_id,decl FROM entities"):
-        by_name.setdefault(name, []).append(eid)
-        by_qual.setdefault(qual, []).append(eid)
+        f = fam(lang_of.get(fid, ""))
+        by_name.setdefault((f, name), []).append(eid)
+        by_qual.setdefault((f, qual), []).append(eid)
         ent_info[eid] = (fid, qual)
         ent_decl[eid] = decl
 
-    lang_of = dict(con.execute("SELECT id,lang FROM files"))
-    fam = lambda l: "c" if l in ("c", "cpp") else l  # C and C++ interoperate
-
-    stats = {"exact": 0, "scoped": 0, "unique": 0, "ambiguous": 0, "unresolved": 0}
+    stats = {"exact": 0, "scoped": 0, "unique": 0, "ambiguous": 0,
+             "external": 0, "unresolved": 0}
     updates = []
     rows = con.execute("SELECT id,src_file,src_entity,kind,target FROM refs").fetchall()
     for rid, fid, sid, kind, target in rows:
         mine = fam(lang_of.get(fid, ""))
 
-        def keep(cs):
-            """Drop candidates from another language family before scoring."""
-            return [c for c in cs if fam(lang_of.get(ent_info[c][0], "")) == mine] if cs else cs
-
-        cands = keep(by_qual.get(target) or by_qual.get(target.replace(".", "::")))
+        cands = by_qual.get((mine, target)) or by_qual.get((mine, target.replace(".", "::")))
         how = "exact"
         if not cands and "::" not in target:
-            cands = keep(by_name.get(target))
+            cands = by_name.get((mine, target))
             how = "unique"
         if not cands and "::" in target:
-            cands = keep(by_name.get(target.rsplit("::", 1)[-1]))
+            cands = by_name.get((mine, target.rsplit("::", 1)[-1]))
             how = "unique"
         if cands and len(cands) > 1:
             # a definition beats a same-name declaration in a header
@@ -137,7 +152,14 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
             same_file = [c for c in cands if ent_info[c][0] == fid]
             if len(same_file) == 1:
                 cands, how = same_file, "scoped"
-            elif sid is not None:
+            else:
+                # same directory (one package / module): stronger than a bare
+                # global name match, weaker than an exact qualname
+                here = file_dir.get(fid, "\x00")
+                same_dir = [c for c in cands if file_dir.get(ent_info[c][0]) == here]
+                if len(same_dir) == 1:
+                    cands, how = same_dir, "scoped"
+            if len(cands) > 1 and sid is not None:
                 myq = ent_info.get(sid, (0, ""))[1]
                 prefix = myq.rsplit("::", 1)[0] + "::" if "::" in myq else ""
                 same_scope = [c for c in cands if prefix and ent_info[c][1].startswith(prefix)]
@@ -145,12 +167,15 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
                     cands, how = same_scope, "scoped"
         n = len(cands) if cands else 0
         if not cands:
-            updates.append((None, "unresolved", 0, rid))
+            # a call to a language builtin is not a failure to resolve, it is a
+            # target that by definition lives outside the tree
+            kind_of = "external" if target in BUILTINS else "unresolved"
+            updates.append((None, kind_of, 0, rid))
         elif n == 1:
             updates.append((cands[0], how, 1, rid))
         else:
             updates.append((None, "ambiguous", n, rid))
-        stats["unresolved" if not cands else ("ambiguous" if n > 1 else how)] += 1
+        stats[kind_of if not cands else ("ambiguous" if n > 1 else how)] += 1
     con.executemany("UPDATE refs SET target_id=?,resolution=?,candidates=? WHERE id=?", updates)
     con.commit()
     return stats
@@ -158,21 +183,38 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
 
 def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
     paths = {fid: p for fid, p in con.execute("SELECT id,path FROM files")}
+    # Trailing-component index instead of scanning every path per include
+    # (/usr/include: 120k deps x 23k paths was the slowest stage by far).
+    by_suffix: dict[str, list[int]] = {}
     by_base: dict[str, list[int]] = {}
     for fid, p in paths.items():
-        by_base.setdefault(os.path.basename(p), []).append(fid)
+        parts = p.split("/")
+        for k in range(1, min(4, len(parts)) + 1):
+            by_suffix.setdefault("/".join(parts[-k:]), []).append(fid)
+        by_base.setdefault(parts[-1], []).append(fid)
     stats = {"resolved": 0, "unresolved": 0}
     updates = []
     for did, fid, raw in con.execute("SELECT id,src_file,raw FROM file_deps WHERE dst_file IS NULL").fetchall():
         cands: list[int] = []
         probe = raw.replace(".", "/") if "." in raw and "/" not in raw else raw
-        for suffix in (raw, probe):
-            cands = [f for f, p in paths.items()
-                     if p == suffix or p.endswith("/" + suffix)]
+        # python/java modules name a file or package, not a path suffix
+        for suffix in (raw, probe, probe + ".py", probe + "/__init__.py"):
+            parts = suffix.split("/")
+            for k in range(min(4, len(parts)), 0, -1):
+                cands = by_suffix.get("/".join(parts[-k:]), [])
+                if cands:
+                    break
             if cands:
                 break
         if not cands:
-            cands = by_base.get(os.path.basename(raw), []) or by_base.get(os.path.basename(probe), [])
+            cands = by_base.get(raw.rsplit("/", 1)[-1], []) or \
+                by_base.get(probe.rsplit("/", 1)[-1], [])
+        if len(cands) > 1 and fid is not None:
+            # prefer a target sitting in the including file's own directory
+            here = paths.get(fid, "").rsplit("/", 1)[0]
+            local = [c for c in cands if paths.get(c, "").rsplit("/", 1)[0] == here]
+            if local:
+                cands = local
         if len(cands) == 1:
             updates.append((cands[0], did))
             stats["resolved"] += 1

@@ -19,6 +19,13 @@ class Shape:
         return helper(self.w) * k
 
 
+class Square(Shape):
+    """Inherits scale() so the resolver has a class edge to follow."""
+
+    def __init__(self, side):
+        super().__init__(side, side)
+
+
 def main():
     s = Shape(2, 3)
     return s.scale(2)

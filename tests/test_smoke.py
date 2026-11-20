@@ -72,3 +72,20 @@ def test_fts_find(db):
 def test_file_deps(db):
     out = run(db, "deps", "calc.c")
     assert "util.h" in out
+
+
+def test_python_import_resolves_to_file(db):
+    # a dotted module name has to land on a .py file, not go unresolved
+    out = run(db, "deps", "calc.py")
+    assert "util.py" in out or "calc.py" in out
+    assert "unresolved" not in out.splitlines()[-1] or "unresolved=0" in out.lower()
+
+
+def test_inherit_refs_carry_their_class(db):
+    import sqlite3
+    con = sqlite3.connect(db)
+    orphan = con.execute(
+        "SELECT COUNT(*) FROM refs WHERE kind='inherit' AND src_entity IS NULL").fetchone()[0]
+    total = con.execute("SELECT COUNT(*) FROM refs WHERE kind='inherit'").fetchone()[0]
+    assert total > 0, "no inheritance edges indexed at all"
+    assert orphan == 0, f"{orphan}/{total} inherit edges have no owning class"

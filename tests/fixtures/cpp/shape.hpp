@@ -7,3 +7,9 @@ public:
 private:
     int w_, h_;
 };
+
+class Square : public Shape {
+public:
+    explicit Square(int side) : Shape(side, side) {}
+    int scale(int k);
+};
