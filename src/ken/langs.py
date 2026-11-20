@@ -139,8 +139,10 @@ class Builder:
         return "::".join(p for p in parts if p)
 
     def add_ent(self, kind: str, name: str, node, prefix: str = "") -> int:
-        decl = 1 if kind == "decl_method" else 0
-        if kind in ("function", "decl_method") and self.stack and \
+        decl = 1 if kind.startswith("decl_") else 0
+        if decl:
+            kind = kind[5:]
+        if kind in ("function", "method") and self.stack and \
                 self.ents[self.stack[-1]]["kind"] in ("class", "struct", "interface", "enum"):
             kind = "method"
         e = {
@@ -225,12 +227,106 @@ def _c_call_target(node, src):
     return name_of(node.child_by_field_name("function"), src)
 
 
+def _fn_declarator(node):
+    """The function_declarator under a C declaration, if this declaration declares one.
+
+    A `.h` line and a `.c` definition say the same thing about the API, and the
+    header is the half a reader meets first, so prototypes are indexed as
+    entities. Local variables are `declaration` nodes too, so the test is
+    structural rather than "does this file end in .h".
+    """
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type == "function_declarator":
+            return n
+        if n.type in ("declaration", "pointer_declarator", "parenthesized_declarator"):
+            stack.extend(n.named_children)
+    return None
+
+
+def _has_proto(node):
+    # `CHECK(Json(p).dump() == x);` at statement position is a valid C++
+    # declaration of a function named CHECK, so a block-scope "prototype" is
+    # almost always an unexpanded macro call, never API.  Headers declare at
+    # file, namespace or linkage scope; that is the only place worth reading.
+    return _at_decl_scope(node) and _fn_declarator(node) is not None
+
+
+def _c_proto_name(node, src):
+    fd = _fn_declarator(node)
+    if fd is None:
+        return "", ""
+    return name_of(fd.child_by_field_name("declarator"), src)
+
+
+def _c_macro_name(node, src):
+    n = node.child_by_field_name("name")
+    return "", text(src, n) if n is not None else ""
+
+
+def _c_alias_name(node, src):
+    d = node.child_by_field_name("declarator")
+    if d is not None and d.type == "function_declarator":
+        d = d.child_by_field_name("declarator")
+    return "", name_of(d, src)[1] if d is not None else ""
+
+
+def _cpp_alias_name(node, src):
+    n = node.child_by_field_name("name")
+    return "", text(src, n) if n is not None else ""
+
+
 def _method_invocation(node, src):
     return name_of(node.child_by_field_name("name"), src)
 
 
 def _new_target(node, src):
     return name_of(node.child_by_field_name("type"), src)
+
+
+# Preprocessor conditionals hoist their contents into the surrounding
+# declaration list, so a declaration's parent can legitimately be one of these.
+_DECL_SCOPES = ("translation_unit", "declaration_list", "field_declaration_list",
+                "linkage_specification", "preproc_if", "preproc_ifdef",
+                "preproc_else", "preproc_elif", "namespace_definition",
+                "class_specifier", "struct_specifier", "union_specifier",
+                "template_declaration", "declaration")
+
+
+CALLABLE = ("function", "decl_function", "method", "decl_method")
+
+
+def _declarator_ok(node) -> bool:
+    """False when tree-sitter could not actually read the declarator.
+
+    `CHECK(j == Json::object());` and `SECTION("x") { ... }` are macro calls,
+    but the C++ grammar accepts both as declarations and recovers by leaving
+    ERROR nodes inside the declarator.  Real declarations never carry ERROR
+    there, so a name recovered from such a declarator is a guess at a macro's
+    spelling rather than a function anyone can call.
+    """
+    d = node.child_by_field_name("declarator")
+    if d is None:
+        return True
+    stack = [d]
+    while stack:
+        x = stack.pop()
+        if x.type == "ERROR":
+            return False
+        stack.extend(x.named_children)
+    return True
+
+
+def _at_decl_scope(node) -> bool:
+    """True when a declaration-like node sits where declarations actually live.
+
+    `CHECK(x)` on its own line is a call, but the C++ grammar also accepts it as
+    a function declaration, and nlohmann's test suite is full of assertion
+    macros at statement position.  A "declaration" inside a function body or a
+    macro body is an unexpanded macro call, never API, so scope decides.
+    """
+    return node.parent is not None and node.parent.type in _DECL_SCOPES
 
 
 def _has_fn_declarator(node) -> bool:
@@ -260,6 +356,16 @@ SPEC["c"] = {
     "struct_specifier": ("ent", "struct", lambda n, s: ("", text(s, n.child_by_field_name("name")) if n.child_by_field_name("name") else "")),
     "union_specifier": ("ent", "union", lambda n, s: ("", text(s, n.child_by_field_name("name")) if n.child_by_field_name("name") else "")),
     "enum_specifier": ("ent", "enum", lambda n, s: ("", text(s, n.child_by_field_name("name")) if n.child_by_field_name("name") else "")),
+    "declaration": ("ent", "decl_function", _c_proto_name, _has_proto),
+    # `typedef ... Foo;` names a type the corpus then uses everywhere; without
+    # it every `Foo x;`-style reference lands in the unresolved pile.
+    "type_definition": ("ent", "alias", _c_alias_name),
+    # A function-like macro is the one call target tree-sitter hands you with
+    # no way to follow: the invocation is a call_expression, the definition is
+    # a preproc node.  Indexing the definition turns `CHECK(...)` and
+    # `NLOHMANN_DEFINE_TYPE_INTRUSIVE(...)` from unresolvable calls into calls
+    # to something the reader can actually open.
+    "preproc_function_def": ("ent", "macro", _c_macro_name),
     "call_expression": ("ref", "call", _c_call_target),
     "preproc_include": ("dep", "include", _include_raw),
 }
@@ -272,9 +378,17 @@ cpp.update({
     "template_declaration": ("transparent", None, None),
     "field_declaration": ("ent", "decl_method",
                           lambda n, s: name_of(n.child_by_field_name("declarator"), s),
-                          _has_fn_declarator),
-    "function_definition": ("ent", "function", _cpp_fn_prefix),
+                          lambda n: _has_fn_declarator(n)
+                          and n.parent is not None
+                          and n.parent.type == "field_declaration_list"),
+    # `SECTION("name") { ... }` is a macro that takes a block.  The grammar has
+    # no way to know that, so it reads a function named SECTION with a body, and
+    # every test section becomes a phantom function plus a phantom class scope.
+    # Functions are declared at translation-unit, namespace, class or linkage
+    # scope; a function definition directly inside a block is a macro.
+    "function_definition": ("ent", "function", _cpp_fn_prefix, _at_decl_scope),
     "new_expression": ("ref", "instantiate", _new_target),
+    "alias_declaration": ("ent", "alias", _cpp_alias_name),
 })
 SPEC["cpp"] = cpp
 
@@ -288,6 +402,8 @@ SPEC["python"] = {
 SPEC["java"] = {
     "class_declaration": ("ent", "class", _java_entity),
     "interface_declaration": ("ent", "interface", _java_entity),
+    "annotation_type_declaration": ("ent", "interface", _java_entity),
+    "annotation_type_element_declaration": ("ent", "method", _java_entity),
     "enum_declaration": ("ent", "enum", _java_entity),
     "method_declaration": ("ent", "method", _java_entity),
     "constructor_declaration": ("ent", "method", _java_entity),
@@ -358,7 +474,7 @@ def _drive(b: Builder, node, spec) -> None:
             _, ekind, namer = act[:3]
             pred = act[3] if len(act) > 3 else None
             prefix, name = ("", "") if (pred is not None and not pred(n)) else namer(n, b.src)
-            if not name:
+            if not name or (ekind in CALLABLE and not _declarator_ok(n)):
                 work.extend(visit(n))
                 continue
             b.stack.append(b.add_ent(ekind, name, n, prefix))

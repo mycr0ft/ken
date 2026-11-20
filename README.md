@@ -2,7 +2,11 @@
 
 A small, open-source code comprehension index: parse a C / C++ / Python / Java
 tree, store every entity, reference and dependency in SQLite, then ask questions
-about it from the shell.
+about it from the shell, or browse it in the bundled web front end.
+
+Rust, Go and JavaScript are the next languages in, and the plan (what a language
+costs, what each one gets wrong, which corpus exercises it) is in
+`docs/languages.md`. Fortran and COBOL are not coming.
 
 `ken` is a from-scratch answer to the archived Sourcetrail and to commercial
 Understand: no clang, no JVM, no compile database at index time. Parsing is
@@ -31,25 +35,32 @@ ken --db my.db graph main --depth 3      # call graph tree (--dot for Graphviz)
 ken --db my.db graph helper --direction up
 ```
 
-Index output also reports resolution quality:
+Index output also reports resolution quality, on two denominators:
 
 ```
-indexed 7 files, 23 entities, 18 refs in 0.0s
-refs  exact=11  scoped=0  unique=6  ambiguous=1  external=1  unresolved=4  -> resolved 77.3%
-deps  resolved=2  unresolved=5
+pruned 7 macro look-alikes
+indexed 101 files, 2065 entities, 4489 refs in 0.3s
+refs  exact=3473  scoped=208  unique=2  ambiguous=286  external=520  unresolved=0
+      82.0% of all refs name one definition, 92.8% of the 3969 in-tree refs
+deps  resolved=163  unresolved=226
 ```
 
-`external` is a call to a language builtin (`len`, `hasattr`, `super`): a target
-that by definition lives outside the tree, so it is neither resolved nor a
-failure. `unresolved` is a real miss (typically a library call such as
-`printf` or `List.of`). Both are counted, never silently dropped. `resolved%`
-is computed over references that have an in-tree candidate at all.
+The first percentage counts every reference, the second drops the ones naming
+something the corpus never introduces, which is the only denominator on which
+a 19k-line tree and a 240k-line tree are comparable. The classes mean what they
+say: `external` is a name no entity anywhere in the index carries (`printf`,
+the JDK collections, a Python builtin); `unresolved` is the narrower miss where
+the name exists in the tree but nothing callable answers to it; `ambiguous`
+means several definitions do, and the candidate count is stored instead of a
+guess.
 
-Measured on two real trees: 202 files / 172k lines of Python and C++ gives
-44% resolved, 24% external, 16% ambiguous, 16% unresolved in 4 s; 23.5k headers
-of `/usr/include` gives 22% resolved in 1m53s (a declarations-only tree is the
-worst case for name-based resolution, and the reason `ambiguous` is recorded
-with its candidate count rather than guessed at).
+Four small corpora, one per language, with the numbers to move whenever a
+parsing or resolution rule changes, are documented in `docs/corpora.md`. Share
+of references naming exactly one definition: C 82%, C++ 28%, Python 47%, Java
+26%; restricted to in-tree references, 93%, 43%, 80%, 44%. C++ is the outlier
+for a structural reason: a member call is indexed as a bare member name, and
+`get`, `size` and `begin` each have a dozen definitions in a header-only
+library.
 
 ## What is in the database
 
@@ -110,13 +121,13 @@ DB-derived and re-reads on navigation:
 | `#/uml?path=&limit=` | class diagram: packages as panels, inheritance solid, use dashed |
 | `#/packages` | package diagram: one box per directory, arrows for cross-package dependencies |
 | `#/seq/<id>?limit=&depth=` | sequence diagram: an interaction trace out of one operation, one lifeline per class |
+| `#/diagrams` | hub for the three diagram views, with the entry points ranked by distinct call targets |
 | `#/search?q=&in=symbols\|files` | full-text search over names, qualified names, and paths |
 
 Two things worth knowing about the diagrams. The class diagram selects a
 *connected* neighbourhood by breadth-first walk from the structurally busiest
 classes, capped per file, per directory, and per class name: a generated
-parser's three hundred sibling context classes would otherwise take every slot.
-and the call graph buckets by file rather than drawing one node per symbol,
+parser's three hundred sibling context classes would otherwise take every slot. The call graph buckets by file rather than drawing one node per symbol,
 because a two-hundred-node graph is a hairball at any zoom level.
 
 The three diagram views cross-link the way an IDE's do: a package box opens its
@@ -181,6 +192,14 @@ unique per package (`Name_2`) rather than dropping classes on collision, and
   `class A(B)`, `extends`); interfaces mixed in by macro or by generated code
   are missed.
 * Files that fail to parse are listed and skipped rather than killing the run.
+* C++ is the weak language, and measurably so: 35,057 of 91,571 references in a
+  header-only library (38%) are ambiguous because member calls carry no receiver
+  type. Fixing that needs a type checker, which is the clang dependency this tool
+  exists to avoid. 50 files in that corpus also index zero entities, because
+  their entire content is a macro argument (`TEST_CASE("...") { ... }`).
+* Prototypes and definitions share an entity kind and are told apart by the
+  `decl` flag, so `sym` on a header prototype and on its definition are the same
+  symbol only when the qualname matches exactly.
 
 ## Related work
 

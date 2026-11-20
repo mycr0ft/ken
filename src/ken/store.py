@@ -111,6 +111,111 @@ append extend insert remove pop keys values items get update split join strip
 lstrip rstrip replace startswith endswith format encode decode read write close
 """.split())
 
+LIBC = frozenset("""
+malloc calloc realloc free memcpy memmove memset memcmp memchr strlen strnlen
+strcpy strncpy strcat strncat strcmp strncmp strchr strrchr strstr strtok strdup
+strerror sprintf snprintf vsprintf vsnprintf sscanf printf fprintf vfprintf
+puts fputs putchar fputc fgetc fgets fopen fclose fread fwrite fflush fseek
+ftell rewind feof ferror remove rename tmpfile tmpnam perror
+atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof
+abs labs llabs div ldiv qsort bsearch rand srand rand_r exit abort atexit
+getenv setenv unsetenv system sleep usleep getcwd chdir mkdir rmdir unlink
+isalpha isdigit isalnum isspace isupper islower isprint ispunct isxdigit
+toupper tolower toascii
+sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 log2 pow sqrt
+ceil floor fabs fmod round trunc fmin fmax fdim hypot
+time clock difftime mktime localtime gmtime strftime ctime
+va_start va_end va_arg va_copy assert offsetof
+open close read write lseek stat fstat ioctl socket bind listen accept connect
+send recv pthread_create pthread_join pthread_mutex_lock pthread_mutex_unlock
+""".split())
+
+# Names that belong to the Java platform rather than to any given tree.  Only
+# types and the handful of static/framework entry points that show up as bare
+# call targets are listed; everything else is still "unresolved", which is the
+# honest answer.
+JAVA_PLATFORM = frozenset("""
+Object String Integer Long Short Byte Double Float Boolean Character Number
+StringBuilder StringBuffer CharSequence Comparable Iterable Runnable Thread
+Exception RuntimeException Error Throwable IllegalArgumentException
+IllegalStateException NullPointerException UnsupportedOperationException
+IndexOutOfBoundsException NumberFormatException AssertionError Class Object
+ArrayList LinkedList HashMap LinkedHashMap TreeMap HashSet LinkedHashSet
+TreeSet Arrays Collections List Map Set Collection Iterator Optional Objects
+BigDecimal BigInteger Date Calendar Locale UUID
+StringWriter StringReader BufferedReader InputStreamReader File InputStream
+OutputStream PrintStream IOException
+Character StringJoiner Enum EnumSet EnumMap Comparator Spliterator Stream
+Collectors Matcher Pattern AtomicInteger AtomicLong AtomicReference
+WeakHashMap IdentityHashMap Properties Random Scanner Formatter
+requireNonNull getClass hashCode toString equals clone notifyAll
+""".split())
+
+# Assertion and mocking DSLs are the other half of a Java test corpus: the call
+# target is a static import, so nothing in the tree carries the name.
+JAVA_DSL = frozenset("""
+assertThat assertThrows assertDoesNotThrow assertThatCode assertThatException
+assertThatThrownBy fail failBecauseExceptionWasNotThrown
+isEqualTo isNotEqualTo isSameAs isNotSameAs isNull isNotNull isTrue isFalse
+isInstanceOf isNotInstanceOf isAnything isA isIn isNotIn isGreaterThan
+isLessThan isAtLeast isAtMost isEmpty isNotEmpty hasSize hasMessage
+hasMessageThat hasMessageContaining hasCause hasToString hasSameHashCodeAs
+contains containsExactly containsExactlyInAnyOrder containsAll containsInAnyOrder
+doesNotContain startsWith endsWith matches startsWithIgnoringCase
+containsExactlyElementsIn inOrder not isNot that named describedAs
+assertEquals assertNotEquals assertTrue assertFalse assertNull assertNotNull
+assertArrayEquals assertSame assertNotSame assertSameElements
+verify when thenReturn thenThrow mock spy given expectAny
+""".split())
+
+
+CALLEE = frozenset((
+    "function", "method", "decl_function", "decl_method", "macro",
+    "class", "struct", "interface", "enum",
+))
+
+
+def _outside(fam: str, target: str) -> bool:
+    """True when the name provably comes from outside the tree's language runtime."""
+    if target in BUILTINS:
+        return True
+    if target.startswith("std::") or target.startswith("::std::"):
+        return True
+    if fam in ("c", "cpp") and target in LIBC:
+        return True
+    if fam == "java" and (target in JAVA_PLATFORM or target in JAVA_DSL):
+        return True
+    return False
+
+
+def prune_macro_phantoms(con: sqlite3.Connection) -> int:
+    """Delete the declarations that are really macro invocations.
+
+    tree-sitter does not expand macros, so `FOO(x) { ... }` is read as a
+    function named FOO with a body, and `CHECK(v);` inside that body is read as
+    a member function declaration.  Catch2/doctest style suites then grow a
+    phantom function per test case and a phantom class per section, and every
+    `CHECK` call in the corpus resolves against those fakes.
+
+    The one reliable signal is that the same corpus also defines FOO as a
+    function-like macro: a name that is a macro cannot be a declaration in a
+    scope where the macro is visible, and macro args are exactly where the
+    grammar guesses wrong.  Entities that survive keep their children by
+    re-parenting, so a real class nested in a phantom section is not lost.
+    """
+    macros = {r[0] for r in con.execute("SELECT name FROM entities WHERE kind='macro'")}
+    if not macros:
+        return 0
+    rows = con.execute("SELECT id,name,parent_id FROM entities "
+                       "WHERE kind IN ('function','decl_function','decl_method','method')").fetchall()
+    doomed = [(i, p) for i, n, p in rows if n in macros]
+    for eid, parent in doomed:
+        con.execute("UPDATE entities SET parent_id=? WHERE parent_id=?", (parent, eid))
+        con.execute("UPDATE refs SET src_entity=NULL WHERE src_entity=?", (eid,))
+        con.execute("DELETE FROM entities WHERE id=?", (eid,))
+    return len(doomed)
+
+
 def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
     """Bind ref.target to entities.id using scope-aware, then global, matching."""
     lang_of = dict(con.execute("SELECT id,lang FROM files"))
@@ -124,13 +229,15 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
     by_name: dict[tuple[str, str], list[int]] = {}
     ent_info: dict[int, tuple[int, str]] = {}
     ent_decl: dict[int, int] = {}
-    for eid, fid, name, qual, parent, decl in con.execute(
-            "SELECT id,file_id,name,qualname,parent_id,decl FROM entities"):
+    ent_kind: dict[int, str] = {}
+    for eid, fid, name, qual, parent, decl, ekind in con.execute(
+            "SELECT id,file_id,name,qualname,parent_id,decl,kind FROM entities"):
         f = fam(lang_of.get(fid, ""))
         by_name.setdefault((f, name), []).append(eid)
         by_qual.setdefault((f, qual), []).append(eid)
         ent_info[eid] = (fid, qual)
         ent_decl[eid] = decl
+        ent_kind[eid] = ekind
 
     stats = {"exact": 0, "scoped": 0, "unique": 0, "ambiguous": 0,
              "external": 0, "unresolved": 0}
@@ -169,11 +276,23 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
                 same_scope = [c for c in cands if prefix and ent_info[c][1].startswith(prefix)]
                 if len(same_scope) == 1:
                     cands, how = same_scope, "scoped"
+        if cands and kind == "call":
+            # A name can be carried by something that cannot be called: a
+            # typedef, a field, a namespace.  Finding the name is then not
+            # finding the callee, and saying "ambiguous" would hide that.
+            cands = [c for c in cands if ent_kind.get(c) in CALLEE]
         n = len(cands) if cands else 0
         if not cands:
-            # a call to a language builtin is not a failure to resolve, it is a
-            # target that by definition lives outside the tree
-            kind_of = "external" if target in BUILTINS else "unresolved"
+            # A call the tree does not contain is only a failure if the name is
+            # meant to be in the tree.  Platform names (libc, the C++ standard
+            # library, the JDK, assertion DSLs) are targets that by definition
+            # live outside it.  This test runs only after the in-tree lookup
+            # fails, so a corpus that ships its own copy of libc still wins.
+            # Nothing in the corpus answers to this name at all, so whatever
+            # the call is aimed at was never in the tree (Catch2, the JDK, a
+            # system header).  Only a name the corpus *does* define, but which
+            # cannot be pinned to one definition, is a gap in the analysis.
+            kind_of = "external" if (target not in by_name or _outside(mine, target)) else "unresolved"
             updates.append((None, kind_of, 0, rid))
         elif n == 1:
             updates.append((cands[0], how, 1, rid))
@@ -193,7 +312,7 @@ def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
     by_base: dict[str, list[int]] = {}
     for fid, p in paths.items():
         parts = p.split("/")
-        for k in range(1, min(4, len(parts)) + 1):
+        for k in range(1, min(6, len(parts)) + 1):
             by_suffix.setdefault("/".join(parts[-k:]), []).append(fid)
         by_base.setdefault(parts[-1], []).append(fid)
     stats = {"resolved": 0, "unresolved": 0}
@@ -202,9 +321,9 @@ def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
         cands: list[int] = []
         probe = raw.replace(".", "/") if "." in raw and "/" not in raw else raw
         # python/java modules name a file or package, not a path suffix
-        for suffix in (raw, probe, probe + ".py", probe + "/__init__.py"):
+        for suffix in (raw, probe, probe + ".py", probe + ".java", probe + "/__init__.py"):
             parts = suffix.split("/")
-            for k in range(min(4, len(parts)), 0, -1):
+            for k in range(min(6, len(parts)), 0, -1):
                 cands = by_suffix.get("/".join(parts[-k:]), [])
                 if cands:
                     break

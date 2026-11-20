@@ -55,13 +55,19 @@ def cmd_index(a) -> None:
             print(f"  {i} files, {n_ent} entities, {n_ref} refs", file=sys.stderr)
     con.commit()
     parse_s = time.time() - t0
+    pruned = store.prune_macro_phantoms(con)
+    if pruned:
+        print(f"pruned {pruned} macro look-alikes", file=sys.stderr)
     rs = store.resolve_refs(con)
     ds = store.resolve_file_deps(con)
     con.commit()
-    total = sum(rs.values()) - rs["external"]
+    total = sum(rs.values())
+    intree = total - rs["external"]
+    hits = rs["exact"] + rs["scoped"] + rs["unique"]
     print(f"indexed {n_files} files, {n_ent} entities, {n_ref} refs in {parse_s:.1f}s")
-    print("refs  " + "  ".join(f"{k}={v}" for k, v in rs.items()) +
-          f"  -> resolved {100.0 * (total - rs['unresolved'] - rs['ambiguous']) / max(total, 1):.1f}%")
+    print("refs  " + "  ".join(f"{k}={v}" for k, v in rs.items()))
+    print(f"      {100.0 * hits / max(total, 1):.1f}% of all refs name one definition, "
+          f"{100.0 * hits / max(intree, 1):.1f}% of the {intree} in-tree refs")
     print("deps  " + "  ".join(f"{k}={v}" for k, v in ds.items()))
     if failed:
         print(f"{len(failed)} files failed to parse")
