@@ -76,10 +76,13 @@ def test_package_limit_clamps_and_reports_omission(con):
 # --- sequence diagram -----------------------------------------------------
 
 def _busiest_call_site(con):
+    # resolved calls only: the diagram draws interactions between objects it can
+    # name, so a site whose calls all leave the corpus produces an empty diagram
     row = con.execute("""SELECT src_entity, COUNT(*) AS n FROM refs
-                          WHERE kind IN ('call','instantiate') AND src_entity IS NOT NULL
-                       GROUP BY src_entity ORDER BY n DESC LIMIT 1""").fetchone()
-    assert row is not None, "fixture has no calls"
+                          WHERE kind IN ('call','instantiate')
+                            AND src_entity IS NOT NULL AND target_id IS NOT NULL
+                       GROUP BY src_entity ORDER BY n DESC, src_entity LIMIT 1""").fetchone()
+    assert row is not None, "fixture has no resolved calls"
     return row[0]
 
 
@@ -108,6 +111,23 @@ def test_sequence_counts_traffic_per_lifeline(con):
     # a lifeline exists only because a message touches it, so none may be idle
     for life in d["lifelines"]:
         assert life["in"] + life["out"] > 0, life
+
+
+def test_calls_leaving_the_corpus_land_on_a_boundary_lifeline(con):
+    from ken.web.server import api_sequence
+
+    row = con.execute("""SELECT src_entity FROM refs
+                          WHERE kind = 'call' AND src_entity IS NOT NULL
+                            AND target_id IS NULL AND target IS NOT NULL
+                       ORDER BY src_entity LIMIT 1""").fetchone()
+    assert row is not None, "fixture has no external calls"
+    d = api_sequence(con, {"id": str(row[0]), "limit": "200"})
+    ext = [l for l in d["lifelines"] if l["kind"] == "x"]
+    assert ext and ext[0]["label"] == "«external»", d["lifelines"]
+    assert ext[0]["id"] == 0
+    # the diagram must not read as "no interactions" just because none of the
+    # calls stay inside the corpus
+    assert d["messages"], d
 
 
 def test_sequence_limit_is_clamped_and_reports_truncation(con):

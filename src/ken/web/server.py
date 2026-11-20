@@ -710,25 +710,29 @@ def api_sequence(con, params):
             continue
         done.add(cur)
         src_owner = _owner_of(con, cur, cache) or origin
-        for c in _rows(con, """SELECT r.line, r.kind, r.target, r.target_id
-                                FROM refs r
-                               WHERE r.src_entity = ? AND r.kind IN ('call','instantiate')
-                            ORDER BY r.line""", (cur,)):
+        group = _rows(con, """SELECT r.line, r.kind, r.target, r.target_id
+                                 FROM refs r
+                                WHERE r.src_entity = ? AND r.kind IN ('call','instantiate')
+                             ORDER BY r.line""", (cur,))
+        for i, c in enumerate(group):
             sites += 1
-            if not c["target_id"]:
-                continue
-            tgt = _owner_of(con, c["target_id"], cache)
+            tgt = _owner_of(con, c["target_id"], cache) if c["target_id"] else None
             if tgt is None:
-                continue
+                # a call that leaves the corpus is still an interaction; collapse
+                # those onto one «external» lifeline, the way UML draws a boundary
+                # actor rather than one box per library function
+                tgt = ("x", 0, "«external»")
             same = tgt[1] == src_owner[1]
             lifelines.setdefault(tgt[1], {"id": tgt[1], "label": tgt[2], "kind": tgt[0]})
             msgs.append({"n": len(msgs) + 1, "s": src_owner[1], "d": tgt[1],
                          "label": c["target"] or tgt[2], "line": c["line"],
                          "kind": c["kind"], "depth": depth, "self": same})
-            if not same and depth + 1 < depth_max:
+            if not same and tgt[1] and depth + 1 < depth_max:
                 stack.append((c["target_id"], depth + 1))
             if len(msgs) >= limit:
-                clipped = True
+                # a diagram that stops exactly at the cap on the last call site
+                # has hidden nothing, and must not claim it did
+                clipped = i < len(group) - 1
                 break
     # the wire speaks lifeline indices, so map entity ids onto positions and
     # count traffic per lifeline (in/out kept apart: a pure caller is not idle)

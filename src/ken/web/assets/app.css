@@ -350,6 +350,9 @@ text.elabel { fill: var(--dim); font: 400 9.5px var(--mono); pointer-events: non
 .seqhead text { fill: var(--ink); font: 600 11px var(--mono); pointer-events: none; }
 .seqhead text.n { fill: var(--ink-2); opacity: .82; font: 400 10px var(--mono); }
 .seqhead:hover rect { stroke: var(--accent); }
+/* a boundary actor, not a real entity in the index */
+.seqhead[data-kind="x"] text { fill: var(--dim); font-style: italic; }
+
 line.lifeline { stroke: #39414e; stroke-width: 1; stroke-dasharray: 4 4; }
 rect.act { fill: #2a3038; stroke: #414b59; stroke-width: 1; }
 line.msg, path.msg { fill: none; stroke: #77839a; stroke-width: 1.2; }

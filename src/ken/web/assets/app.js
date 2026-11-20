@@ -1314,7 +1314,7 @@ async function viewSequence(host, eid) {
       <div class="crumb">SEQUENCE DIAGRAM</div>
       <div class="h1line"><a class="sym" href="#/sym/${e.id}">${esc(e.qualname || e.name)}</a>
         <span class="dim mono" style="font-size:11px">${esc(shortPath(e.path))}:${e.line}</span></div>
-      <div class="sub">${d.messages.length} messages · ${d.lifelines.length} lifelines · depth ${d.depth}${d.truncated ? ' · truncated' : ''}</div>
+      <div class="sub">${d.messages.length} messages · ${d.lifelines.length} lifelines · depth ${d.depth}${d.truncated ? ` · showing ${d.messages.length} of ${n(d.total_calls)} call sites` : ''}</div>
     </div>
     <div class="graphbox seqbox"><svg class="seqscene"></svg></div>
     <p class="dim" style="font-size:11.5px;margin-top:10px">
@@ -1389,6 +1389,8 @@ function drawSequence(svg, d) {
   svg.style.height = Math.round(H) + 'px';
   svg.innerHTML = `<g class="scene">${parts.join('')}</g>`;
   $$('g.seqhead', svg).forEach((g) => {
+    // «external» is a boundary, not an entity: there is nothing to open
+    if (g.dataset.kind === 'x') return;
     g.style.cursor = 'pointer';
     g.onclick = () => { location.hash = g.dataset.kind === 'c' ? `#/sym/${g.dataset.id}` : `#/file/${g.dataset.id}`; };
   });
