@@ -11,6 +11,7 @@ qualifying prefix (for out-of-line definitions such as ``void Foo::bar() {}``).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 import tree_sitter as ts
 import tree_sitter_c
@@ -18,20 +19,10 @@ import tree_sitter_cpp
 import tree_sitter_java
 import tree_sitter_python
 
-EXTS = {
-    ".c": "c", ".h": "c",
-    ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".c++": "cpp",
-    ".hpp": "cpp", ".hh": "cpp", ".hxx": "cpp", ".h++": "cpp", ".ipp": "cpp",
-    ".py": "python", ".pyi": "python",
-    ".java": "java",
-}
-
-MODULES = {
-    "c": tree_sitter_c,
-    "cpp": tree_sitter_cpp,
-    "python": tree_sitter_python,
-    "java": tree_sitter_java,
-}
+# Extensions and grammars are not listed here: they are fields of the language
+# records at the bottom of this file, so a language cannot be half-registered
+# (an extension with no grammar, a grammar with no parse table).  See "the
+# registry" there.
 
 _cache: dict[str, ts.Language] = {}
 
@@ -563,10 +554,9 @@ DECISIONS["cpp"] |= {"binary_expression"}
 DECISIONS["java"] |= {"binary_expression"}
 
 
-def _complexity(b: Builder, node) -> int:
+def _complexity(b: Builder, node, decisions) -> int:
     """Cyclomatic complexity of an entity subtree, plus branch operators."""
-    lang = b.lang
-    dec = DECISIONS[lang]
+    dec = decisions
     count = 1
     stack = [node]
     src = b.src
@@ -701,21 +691,238 @@ def _java_imports(b: Builder, root) -> None:
 
 
 def extract(path: str, lang: str, src: bytes) -> Builder:
+    spec = SPECS[lang]
     parser = ts.Parser(language(lang))
     tree = parser.parse(src)
     root = tree.root_node
     b = Builder(path, lang, src)
-    _drive(b, root, SPEC[lang])
+    _drive(b, root, spec.spec)
     # imports/inheritance come after the main walk: inherit edges want the
-    # owning class entity to already exist
-    if lang == "python":
-        _py_imports(b, root)
-        _py_inherits(b, root)
-    elif lang == "java":
-        _java_imports(b, root)
-    else:  # c, cpp
-        _cpp_inherits(b, root)
+    # owning class entity to already exist.  Which passes run, and in what
+    # order, is the language record's business, not this function's.
+    for post in spec.post:
+        post(b, root)
     for e in b.ents:
         if e["kind"] in ("function", "method"):
-            e["complexity"] = _complexity(b, e["_node"])
+            e["complexity"] = _complexity(b, e["_node"], spec.decisions)
     return b
+
+
+# ---------------------------------------------------------------- externals
+#
+# Names that are never defined by any tree we will index, so a reference to one
+# is "external" rather than "unresolved".  This is the honest answer to "where
+# did this call go", and it is data about a language, not about the resolver.
+
+# Runtime names common enough to appear in any corpus: Python builtins and
+# container methods, POSIX I/O, and the handful of C entry points that every
+# language's runtime happens to share.  Shared on purpose: `open`/`read`/`close`
+# are as external in C as they are in Python, and a corpus that defines them
+# defines them as entities anyway, which beats this set.
+COMMON_EXTERNAL = frozenset("""
+abs all any ascii bin bool breakpoint bytearray bytes callable chr classmethod
+compile complex delattr dict dir divmod enumerate eval exec filter float format
+frozenset getattr globals hasattr hash help hex id input int isinstance
+issubclass iter len list locals map max memoryview min next object oct open ord
+pow print property range repr reversed round set setattr slice sorted staticmethod
+str sum super tuple type vars zip __import__ __name__
+append extend insert remove pop keys values items get update split join strip
+lstrip rstrip replace startswith endswith format encode decode read write close
+""".split())
+
+LIBC = frozenset("""
+malloc calloc realloc free memcpy memmove memset memcmp memchr strlen strnlen
+strcpy strncpy strcat strncat strcmp strncmp strchr strrchr strstr strtok strdup
+strerror sprintf snprintf vsprintf vsnprintf sscanf printf fprintf vfprintf
+puts fputs putchar fputc fgetc fgets fopen fclose fread fwrite fflush fseek
+ftell rewind feof ferror remove rename tmpfile tmpnam perror
+atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof
+abs labs llabs div ldiv qsort bsearch rand srand rand_r exit abort atexit
+getenv setenv unsetenv system sleep usleep getcwd chdir mkdir rmdir unlink
+isalpha isdigit isalnum isspace isupper islower isprint ispunct isxdigit
+toupper tolower toascii
+sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 log2 pow sqrt
+ceil floor fabs fmod round trunc fmin fmax fdim hypot
+time clock difftime mktime localtime gmtime strftime ctime
+va_start va_end va_arg va_copy assert offsetof
+open close read write lseek stat fstat ioctl socket bind listen accept connect
+send recv pthread_create pthread_join pthread_mutex_lock pthread_mutex_unlock
+""".split())
+
+# Names that belong to the Java platform rather than to any given tree.  Only
+# types and the handful of static/framework entry points that show up as bare
+# call targets are listed; everything else is still "unresolved", which is the
+# honest answer.
+JAVA_PLATFORM = frozenset("""
+Object String Integer Long Short Byte Double Float Boolean Character Number
+StringBuilder StringBuffer CharSequence Comparable Iterable Runnable Thread
+Exception RuntimeException Error Throwable IllegalArgumentException
+IllegalStateException NullPointerException UnsupportedOperationException
+IndexOutOfBoundsException NumberFormatException AssertionError Class Object
+ArrayList LinkedList HashMap LinkedHashMap TreeMap HashSet LinkedHashSet
+TreeSet Arrays Collections List Map Set Collection Iterator Optional Objects
+BigDecimal BigInteger Date Calendar Locale UUID
+StringWriter StringReader BufferedReader InputStreamReader File InputStream
+OutputStream PrintStream IOException
+Character StringJoiner Enum EnumSet EnumMap Comparator Spliterator Stream
+Collectors Matcher Pattern AtomicInteger AtomicLong AtomicReference
+WeakHashMap IdentityHashMap Properties Random Scanner Formatter
+requireNonNull getClass hashCode toString equals clone notifyAll
+""".split())
+
+# Assertion and mocking DSLs are the other half of a Java test corpus: the call
+# target is a static import, so nothing in the tree carries the name.
+JAVA_DSL = frozenset("""
+assertThat assertThrows assertDoesNotThrow assertThatCode assertThatException
+assertThatThrownBy fail failBecauseExceptionWasNotThrown
+isEqualTo isNotEqualTo isSameAs isNotSameAs isNull isNotNull isTrue isFalse
+isInstanceOf isNotInstanceOf isAnything isA isIn isNotIn isGreaterThan
+isLessThan isAtLeast isAtMost isEmpty isNotEmpty hasSize hasMessage
+hasMessageThat hasMessageContaining hasCause hasToString hasSameHashCodeAs
+contains containsExactly containsExactlyInAnyOrder containsAll containsInAnyOrder
+doesNotContain startsWith endsWith matches startsWithIgnoringCase
+containsExactlyElementsIn inOrder not isNot that named describedAs
+assertEquals assertNotEquals assertTrue assertFalse assertNull assertNotNull
+assertArrayEquals assertSame assertNotSame assertSameElements
+verify when thenReturn thenThrow mock spy given expectAny
+""".split())
+
+
+# ---------------------------------------------------------------- the registry
+#
+# One record per language, and the only place a language is named.  Adding one
+# means adding a record here: extensions, grammar, parse table, complexity node
+# types, post-walk passes, external names, module spelling and a fixture all
+# arrive together, so a language cannot be half-registered.  Nothing outside
+# this file may branch on a language name; the resolver, the CLI and the front
+# end ask the record instead.  `ken langs --check` runs the fixture through
+# extract() and reports, which makes "wired" a test result rather than a claim.
+
+
+@dataclass(frozen=True)
+class LangSpec:
+    #: file extensions claimed, lower-case with the dot
+    exts: tuple[str, ...]
+    #: the tree-sitter grammar binding module
+    grammar: object
+    #: parse table: node type -> ("ent"|"ref"|"dep"|"transparent", ...)
+    spec: dict
+    #: node types counted as branch points by _complexity
+    decisions: frozenset[str]
+    #: node types in which a declaration may legitimately sit (C/C++ scope
+    #: guards); empty when the language has no such ambiguity
+    decl_scopes: tuple[str, ...] = ()
+    #: passes to run after the main walk, in order (imports, inheritance)
+    post: tuple = ()
+    #: names that provably come from outside the tree's runtime
+    external: frozenset[str] = frozenset()
+    #: True when `.` separates module components, so `a.b` may be the file a/b
+    module_paths: bool = False
+    #: extra suffixes tried when resolving an import to a file
+    import_suffixes: tuple[str, ...] = ()
+    #: languages whose entities resolve against each other (C and C++ share a
+    #: name space because they interoperate)
+    family: str = ""
+    #: minimal source that must yield entities and at least one reference
+    fixture: str = ""
+
+
+SPECS: dict[str, LangSpec] = {
+    "c": LangSpec(
+        exts=(".c", ".h"),
+        grammar=tree_sitter_c,
+        spec=SPEC["c"],
+        decisions=frozenset(DECISIONS["c"]),
+        decl_scopes=_DECL_SCOPES,
+        post=(_cpp_inherits,),
+        external=COMMON_EXTERNAL | LIBC,
+        family="c",
+        fixture="""
+static int add(int a, int b);
+
+int add(int a, int b) { return a + b; }
+
+int main(void) { return add(1, 2); }
+""",
+    ),
+    "cpp": LangSpec(
+        exts=(".cc", ".cpp", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++", ".ipp"),
+        grammar=tree_sitter_cpp,
+        spec=SPEC["cpp"],
+        decisions=frozenset(DECISIONS["cpp"]),
+        decl_scopes=_DECL_SCOPES,
+        post=(_cpp_inherits,),
+        external=COMMON_EXTERNAL | LIBC,
+        family="c",
+        fixture="""
+struct Shape { virtual double area() const = 0; };
+
+struct Square : public Shape {
+    double s;
+    double area() const override { return s * s; }
+};
+
+int main() { Square q{2.0}; return (int)q.area(); }
+""",
+    ),
+    "python": LangSpec(
+        exts=(".py", ".pyi"),
+        grammar=tree_sitter_python,
+        spec=SPEC["python"],
+        decisions=frozenset(DECISIONS["python"]),
+        post=(_py_imports, _py_inherits),
+        external=COMMON_EXTERNAL,
+        module_paths=True,
+        import_suffixes=(".py", "/__init__.py"),
+        fixture="""
+import os
+
+
+class Base:
+    def run(self):
+        return helper()
+
+
+def helper():
+    return os.getcwd()
+""",
+    ),
+    "java": LangSpec(
+        exts=(".java",),
+        grammar=tree_sitter_java,
+        spec=SPEC["java"],
+        decisions=frozenset(DECISIONS["java"]),
+        post=(_java_imports,),
+        external=COMMON_EXTERNAL | JAVA_PLATFORM | JAVA_DSL,
+        module_paths=True,
+        import_suffixes=(".java",),
+        fixture="""
+package demo;
+
+import java.util.List;
+
+public class Greeter extends Base {
+    public String greet(List<String> names) { return names.get(0); }
+}
+""",
+    ),
+}
+
+
+# Derived views.  Callers that only need "which language is this file" or "the
+# grammar object" keep working; anything that wants a language fact should hold
+# the record instead.
+
+EXTS = {ext: name for name, s in SPECS.items() for ext in s.exts}
+MODULES = {name: s.grammar for name, s in SPECS.items()}
+
+
+def spec_for(lang: str) -> LangSpec:
+    """The record for a language, or KeyError with a useful message."""
+    try:
+        return SPECS[lang]
+    except KeyError:
+        raise KeyError(f"unregistered language {lang!r}; "
+                       f"registered: {sorted(SPECS)}") from None
+
+

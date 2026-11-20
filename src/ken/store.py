@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import sqlite3
 
-from .langs import doc_links
+from .langs import SPECS, doc_links
 
 SCHEMA_TABLES = """
 PRAGMA journal_mode=WAL;
@@ -137,94 +137,22 @@ def add_file(con: sqlite3.Connection, path: str, lang: str, src: bytes, b) -> in
 
 # ------------------------------------------------------------------ resolution
 
-# Language builtins worth naming: they dominate the unresolved list on Python
-# and saying "external" is more accurate than "unresolved".
-BUILTINS = frozenset("""
-abs all any ascii bin bool breakpoint bytearray bytes callable chr classmethod
-compile complex delattr dict dir divmod enumerate eval exec filter float format
-frozenset getattr globals hasattr hash help hex id input int isinstance
-issubclass iter len list locals map max memoryview min next object oct open ord
-pow print property range repr reversed round set setattr slice sorted staticmethod
-str sum super tuple type vars zip __import__ __name__
-append extend insert remove pop keys values items get update split join strip
-lstrip rstrip replace startswith endswith format encode decode read write close
-""".split())
-
-LIBC = frozenset("""
-malloc calloc realloc free memcpy memmove memset memcmp memchr strlen strnlen
-strcpy strncpy strcat strncat strcmp strncmp strchr strrchr strstr strtok strdup
-strerror sprintf snprintf vsprintf vsnprintf sscanf printf fprintf vfprintf
-puts fputs putchar fputc fgetc fgets fopen fclose fread fwrite fflush fseek
-ftell rewind feof ferror remove rename tmpfile tmpnam perror
-atoi atol atoll atof strtol strtoul strtoll strtoull strtod strtof
-abs labs llabs div ldiv qsort bsearch rand srand rand_r exit abort atexit
-getenv setenv unsetenv system sleep usleep getcwd chdir mkdir rmdir unlink
-isalpha isdigit isalnum isspace isupper islower isprint ispunct isxdigit
-toupper tolower toascii
-sin cos tan asin acos atan atan2 sinh cosh tanh exp log log10 log2 pow sqrt
-ceil floor fabs fmod round trunc fmin fmax fdim hypot
-time clock difftime mktime localtime gmtime strftime ctime
-va_start va_end va_arg va_copy assert offsetof
-open close read write lseek stat fstat ioctl socket bind listen accept connect
-send recv pthread_create pthread_join pthread_mutex_lock pthread_mutex_unlock
-""".split())
-
-# Names that belong to the Java platform rather than to any given tree.  Only
-# types and the handful of static/framework entry points that show up as bare
-# call targets are listed; everything else is still "unresolved", which is the
-# honest answer.
-JAVA_PLATFORM = frozenset("""
-Object String Integer Long Short Byte Double Float Boolean Character Number
-StringBuilder StringBuffer CharSequence Comparable Iterable Runnable Thread
-Exception RuntimeException Error Throwable IllegalArgumentException
-IllegalStateException NullPointerException UnsupportedOperationException
-IndexOutOfBoundsException NumberFormatException AssertionError Class Object
-ArrayList LinkedList HashMap LinkedHashMap TreeMap HashSet LinkedHashSet
-TreeSet Arrays Collections List Map Set Collection Iterator Optional Objects
-BigDecimal BigInteger Date Calendar Locale UUID
-StringWriter StringReader BufferedReader InputStreamReader File InputStream
-OutputStream PrintStream IOException
-Character StringJoiner Enum EnumSet EnumMap Comparator Spliterator Stream
-Collectors Matcher Pattern AtomicInteger AtomicLong AtomicReference
-WeakHashMap IdentityHashMap Properties Random Scanner Formatter
-requireNonNull getClass hashCode toString equals clone notifyAll
-""".split())
-
-# Assertion and mocking DSLs are the other half of a Java test corpus: the call
-# target is a static import, so nothing in the tree carries the name.
-JAVA_DSL = frozenset("""
-assertThat assertThrows assertDoesNotThrow assertThatCode assertThatException
-assertThatThrownBy fail failBecauseExceptionWasNotThrown
-isEqualTo isNotEqualTo isSameAs isNotSameAs isNull isNotNull isTrue isFalse
-isInstanceOf isNotInstanceOf isAnything isA isIn isNotIn isGreaterThan
-isLessThan isAtLeast isAtMost isEmpty isNotEmpty hasSize hasMessage
-hasMessageThat hasMessageContaining hasCause hasToString hasSameHashCodeAs
-contains containsExactly containsExactlyInAnyOrder containsAll containsInAnyOrder
-doesNotContain startsWith endsWith matches startsWithIgnoringCase
-containsExactlyElementsIn inOrder not isNot that named describedAs
-assertEquals assertNotEquals assertTrue assertFalse assertNull assertNotNull
-assertArrayEquals assertSame assertNotSame assertSameElements
-verify when thenReturn thenThrow mock spy given expectAny
-""".split())
+# Language builtins and platform names live in the language records (langs.py),
+# because "which names are external" is a fact about a language, not about the
+# resolver.  The resolver stays language-blind: it asks the record.
+def _outside(spec, target: str) -> bool:
+    """True when the name provably comes from outside the tree's language runtime."""
+    if target in spec.external:
+        return True
+    if target.startswith("std::") or target.startswith("::std::"):
+        return True
+    return False
 
 
 CALLEE = frozenset((
     "function", "method", "decl_function", "decl_method", "macro",
     "class", "struct", "interface", "enum",
 ))
-
-
-def _outside(fam: str, target: str) -> bool:
-    """True when the name provably comes from outside the tree's language runtime."""
-    if target in BUILTINS:
-        return True
-    if target.startswith("std::") or target.startswith("::std::"):
-        return True
-    if fam in ("c", "cpp") and target in LIBC:
-        return True
-    if fam == "java" and (target in JAVA_PLATFORM or target in JAVA_DSL):
-        return True
-    return False
 
 
 def prune_macro_phantoms(con: sqlite3.Connection) -> int:
@@ -259,7 +187,17 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
     """Bind ref.target to entities.id using scope-aware, then global, matching."""
     lang_of = dict(con.execute("SELECT id,lang FROM files"))
     file_dir = {fid: p.rsplit("/", 1)[0] for fid, p in con.execute("SELECT id,path FROM files")}
-    fam = lambda l: "c" if l in ("c", "cpp") else l  # C and C++ interoperate
+
+    def fam(l):
+        s = SPECS.get(l)
+        return (s.family or l) if s else l
+
+    # One record per family answers "is this name external"; C and C++ carry
+    # the same external set, so whichever of the two is picked is the same
+    # answer, and a future second family will register its own.
+    spec_by_fam: dict = {}
+    for _name, _s in SPECS.items():
+        spec_by_fam.setdefault(fam(_name), _s)
 
     # Candidates are bucketed by language family up front.  Bucketing lazily
     # meant re-scanning huge same-name lists per reference (a name can live in
@@ -331,7 +269,7 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
             # the call is aimed at was never in the tree (Catch2, the JDK, a
             # system header).  Only a name the corpus *does* define, but which
             # cannot be pinned to one definition, is a gap in the analysis.
-            kind_of = "external" if (target not in by_name or _outside(mine, target)) else "unresolved"
+            kind_of = "external" if (target not in by_name or _outside(spec_by_fam[mine], target)) else "unresolved"
             updates.append((None, kind_of, 0, rid))
         elif n == 1:
             updates.append((cands[0], how, 1, rid))
@@ -378,11 +316,17 @@ def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
         by_base.setdefault(parts[-1], []).append(fid)
     stats = {"resolved": 0, "unresolved": 0}
     updates = []
-    for did, fid, raw in con.execute("SELECT id,src_file,raw FROM file_deps WHERE dst_file IS NULL").fetchall():
+    lang_of = dict(con.execute("SELECT id,lang FROM files"))
+    for did, fid, raw in con.execute(
+            "SELECT id,src_file,raw FROM file_deps WHERE dst_file IS NULL").fetchall():
         cands: list[int] = []
-        probe = raw.replace(".", "/") if "." in raw and "/" not in raw else raw
-        # python/java modules name a file or package, not a path suffix
-        for suffix in (raw, probe, probe + ".py", probe + ".java", probe + "/__init__.py"):
+        spec = SPECS.get(lang_of.get(fid, ""))
+        # How a language spells a module is a fact in its record: Java and
+        # Python name `a.b` for the file a/b, C and C++ include a path suffix.
+        probe = raw.replace(".", "/") if (spec and spec.module_paths and "/" not in raw) else raw
+        suffixes = (raw,) + ((probe,) if probe != raw else ()) + (
+            tuple(probe + s for s in spec.import_suffixes) if spec else ())
+        for suffix in suffixes:
             parts = suffix.split("/")
             for k in range(min(6, len(parts)), 0, -1):
                 cands = by_suffix.get("/".join(parts[-k:]), [])
