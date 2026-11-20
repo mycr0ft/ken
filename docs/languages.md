@@ -9,8 +9,13 @@ EQUIVALENCE and preprocessor abuse, which is a different tool.
 Everything below was checked against the actual grammars
 (`tree-sitter-rust`, `tree-sitter-go`, `tree-sitter-javascript`,
 `tree-sitter-typescript`), not against documentation, by parsing the snippets
-in the "node shapes" sections and dumping the field names. A rule that is
-written from memory of a grammar is a rule that silently indexes nothing.
+in the "node shapes" sections and dumping the field names. That check is a
+test: `tests/test_language_plan.py` parses each snippet and fails if a node type
+or field name cited below stops existing, so a grammar upgrade breaks the build
+instead of the index. The versions the tables below were verified against are
+`tree-sitter` 0.26.1 with `tree-sitter-rust` 0.24.2, `tree-sitter-go` 0.25.0,
+`tree-sitter-javascript` 0.25.0 and `tree-sitter-typescript` 0.23.2. A rule written from memory of a grammar is a rule that
+silently indexes nothing.
 
 ## What a language costs today
 
