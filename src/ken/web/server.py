@@ -673,6 +673,46 @@ def _owner_of(con, eid: int, cache: dict):
     return owner
 
 
+def _p(params, key, default):
+    """One query parameter, whether the caller passed a list (as the handler
+    does straight off the URL) or a bare string (as a test does). Reading
+    ``params[key][0]`` on a string silently takes its first character, which
+    turns id=14 into id=1 and answers a question nobody asked."""
+    v = params.get(key)
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else None
+    return default if v is None or v == "" else v
+
+
+MAX_ENTRYPOINTS = 24
+
+
+def api_entrypoints(con, params):
+    """Operations worth starting a trace from: the ones that fan out widest.
+
+    Sequence diagrams exist per operation, so a reader who has just landed in an
+    unfamiliar corpus has nowhere to click. Ranking by how many *different*
+    objects an operation calls is a crude but honest proxy for "this one
+    coordinates the work", and beats ranking by size, which just finds parsers.
+    """
+    want = min(max(_int(_p(params, "limit", MAX_ENTRYPOINTS), MAX_ENTRYPOINTS), 4),
+               MAX_ENTRYPOINTS)
+    rows = _rows(con, """
+        SELECT e.id, e.name, e.qualname, e.line, e.complexity,
+               f.id AS file_id, f.path,
+               COUNT(DISTINCT r.target_id) AS targets,
+               COUNT(*) AS calls
+          FROM entities e
+          JOIN files f ON f.id = e.file_id
+          JOIN refs r ON r.src_entity = e.id AND r.kind IN ('call', 'instantiate')
+         WHERE r.target_id IS NOT NULL AND r.target_id <> e.id
+         GROUP BY e.id
+        HAVING targets >= 2
+         ORDER BY targets DESC, calls DESC, e.id
+         LIMIT ?""", (want,))
+    return {"items": rows, "total": len(rows), "root": _corpus_root(con)}
+
+
 def api_sequence(con, params):
     """UML sequence diagram for one operation: the messages it sends, in source
     order, between the objects that own them.
@@ -681,8 +721,8 @@ def api_sequence(con, params):
     a sequence diagram says what happens first, which is what a reader needs to
     understand a 40-line method.
     """
-    eid = _int((params.get("id") or ["0"])[0])
-    limit = min(max(_int((params.get("limit") or ["18"])[0], 18), 4), MAX_SEQ_MESSAGES)
+    eid = _int(_p(params, "id", 0))
+    limit = min(max(_int(_p(params, "limit", 18), 18), 4), MAX_SEQ_MESSAGES)
     ent = _one(con, """SELECT e.id, e.name, e.qualname, e.kind, e.line, e.end_line,
                               e.complexity, e.file_id, f.path, f.lang
                          FROM entities e JOIN files f ON f.id = e.file_id
@@ -696,7 +736,7 @@ def api_sequence(con, params):
         origin = ("f", f.get("id"), (f.get("path") or ent["path"]).rsplit("/", 1)[-1])
     # depth 1 = the operation's own messages only; each further level follows a
     # cross-object call into that object's code
-    depth_max = min(max(_int((params.get("depth") or ["2"])[0], 2), 1), 4)
+    depth_max = min(max(_int(_p(params, "depth", 2), 2), 1), 4)
     msgs = []
     lifelines = {origin[1]: {"id": origin[1], "label": origin[2], "kind": origin[0]}}
     # Depth-first in call-site order: that is the order a reader follows the
@@ -760,6 +800,7 @@ ROUTES = {
     "/api/metrics": api_metrics,
     "/api/uml": api_uml,
     "/api/packages": api_packages,
+    "/api/entrypoints": api_entrypoints,
     "/api/sequence": api_sequence,
 }
 

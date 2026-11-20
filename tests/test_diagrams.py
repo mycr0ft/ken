@@ -163,6 +163,37 @@ def test_emit_honours_a_scope(con):
     assert nstats["emitted"] == 0 and narrow.strip().startswith("package")
 
 
+def test_entrypoints_are_ranked_and_render(con):
+    """The diagrams hub offers somewhere to start, so every offer must work.
+
+    A landing page that links to traces would be worse than none if a link
+    landed on an empty canvas, so each listed operation is traced here.
+    """
+    from ken.web.server import api_entrypoints, api_sequence
+
+    d = api_entrypoints(con, {})
+    got = d["items"]
+    assert got, "fixture corpus has no operation that calls two distinct targets"
+    assert len(got) <= 24
+    assert d["total"] == len(got)
+    widths = [r["targets"] for r in got]
+    assert widths == sorted(widths, reverse=True), "entry points are not ranked"
+    assert all(w >= 2 for w in widths)
+    for row in got:
+        seq = api_sequence(con, {"id": str(row["id"]), "limit": "8"})
+        assert seq and seq["messages"], f"entry point {row['qualname']} draws an empty trace"
+        assert seq["entity"]["id"] == row["id"]
+
+
+def test_entrypoints_respect_the_cap(con):
+    """A hub that lists one operation is not a hub, so the floor is four, and
+    the ceiling is what the renderer will happily draw."""
+    from ken.web.server import api_entrypoints
+
+    assert len(api_entrypoints(con, {"limit": "1"})["items"]) <= 4
+    assert len(api_entrypoints(con, {"limit": "999"})["items"]) <= 24
+
+
 def test_emit_parses_with_sysmlpy(con):
     sysmlpy = pytest.importorskip("sysmlpy", reason="sysmlpy not installed here")
     text, stats = emit(con)

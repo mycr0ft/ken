@@ -791,6 +791,56 @@ function fit(svg) {
 }
 
 // ---------------------------------------------------------------- diagrams
+// ---------------------------------------------------------------- diagrams hub
+async function viewDiagrams(host, params) {
+  // sequence diagrams are per operation, so this page also answers "where do I
+  // start?" - otherwise the third view is unreachable from the nav
+  const d = await api('/api/entrypoints', { limit: 12 });
+  document.title = 'diagrams · ken';
+  const items = (d && d.items) || [];
+  host.innerHTML = `<div class="wrap">
+    <div class="graphhead" style="display:block">
+      <div class="crumb mono dim" style="font-size:11px;margin-bottom:6px">DIAGRAMS</div>
+      <h1 style="font-size:17px">Four views over one index</h1>
+      <div class="sub">Every picture is read out of the same SQLite index. Nothing is re-parsed to draw a diagram.</div>
+    </div>
+    <div class="dcards">
+      <a class="dcard" href="#/uml">
+        <h2>Class diagram</h2>
+        <p>Types, their attributes and operations, and the relationships the index can prove: inheritance,
+           composition, association. Scope it to a directory when the whole corpus will not fit.</p>
+        <span class="go mono">open →</span>
+      </a>
+      <a class="dcard" href="#/packages">
+        <h2>Package diagram</h2>
+        <p>Directories drawn as components and layered by who depends on whom, so the bottom of the picture is
+           the layer everything else stands on.</p>
+        <span class="go mono">open →</span>
+      </a>
+      <a class="dcard" href="#/graph/${items[0] ? items[0].id : ''}">
+        <h2>Call graph</h2>
+        <p>What one operation calls, and what calls it, out to a few hops. Edges that leave the corpus are
+           labelled rather than hidden.</p>
+        <span class="go mono">open →</span>
+      </a>
+    </div>
+    <div class="graphhead" style="display:block;margin-top:26px">
+      <h2 style="font-size:14px;margin:0 0 2px">Sequence diagrams</h2>
+      <div class="sub">An interaction trace out of one operation. These coordinate the widest: start here if the
+        corpus is unfamiliar.</div>
+    </div>
+    <div class="list" data-entry>${items.map((r) => `
+      <a class="row2" href="#/seq/${r.id}">
+        <span class="t">${esc(r.qualname || r.name)}</span>
+        <span class="s">${esc(shortPath(r.path, d.root))}:${r.line} · ${r.targets} targets · complexity ${r.complexity}</span>
+      </a>`).join('') || '<p class="dim" style="font-size:12px">No operation calls more than one target.</p>'}
+    </div>
+    <p class="dim" style="font-size:11.5px;margin-top:14px">
+      For a whole-system model, <span class="mono">ken sysml</span> emits the same index as SysML v2.
+    </p>
+  </div>`;
+}
+
 async function viewUml(host, params) {
   const path = params.get('path') || '';
   const limit = Number(params.get('limit') || 32);
@@ -1425,7 +1475,9 @@ function drawSequence(svg, d) {
 }
 
 // ---------------------------------------------------------------- router
-const NAV = { '': 'overview', files: 'files', file: 'files', metrics: 'metrics', uml: 'uml', packages: 'packages', seq: 'uml' };
+const NAV = { '': 'overview', files: 'files', file: 'files', metrics: 'metrics',
+              diagrams: 'diagrams', uml: 'diagrams', packages: 'packages', graph: 'diagrams',
+              seq: 'diagrams', sym: 'diagrams' };
 
 async function render() {
   const raw = location.hash.replace(/^#/, '') || '/';
@@ -1443,7 +1495,8 @@ async function render() {
     else if (name === 'sym') await viewSymbol(host, params, Number(seg[1]));
     else if (name === 'graph') {
       await viewGraph(host, params, Number(seg[1]));
-    } else if (name === 'uml') await viewUml(host, params);
+    } else if (name === 'diagrams') await viewDiagrams(host, params);
+    else if (name === 'uml') await viewUml(host, params);
     else if (name === 'packages') await viewPackages(host);
     else if (name === 'seq') await viewSequence(host, params, Number(seg[1]));
     else if (name === 'metrics') await viewMetrics(host, params);
