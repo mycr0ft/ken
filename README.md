@@ -70,12 +70,14 @@ library.
 | table | contents |
 | --- | --- |
 | `files` | path, language, loc, bytes |
-| `entities` | kind, name, `qualname` (`Foo::bar`), parent, line span, complexity, `decl` flag |
+| `entities` | kind, name, `qualname` (`Foo::bar`), parent, line span, complexity, `decl` flag, `doc` (the comment attached to it) |
 | `refs` | call / instantiate / inherit edges, target name, resolved `target_id`, resolution class, candidate count |
+| `doc_links` | a name the documentation mentions (`@see`, `\sa`, `{@link}`, `:func:`), resolved to an entity when the corpus defines it |
 | `file_deps` | `#include` / `import` edges, raw target, resolved destination file |
 
-Indexes on name, qualname, file and ref target; FTS5 mirror of the symbol table
-(`ent_fts`) kept in sync by triggers; WAL so readers never block an index run.
+Indexes on name, qualname, file and ref target; FTS5 mirrors of symbols
+(`ent_fts`) and of documentation prose (`doc_fts`), both kept in sync by
+triggers; WAL so readers never block an index run.
 
 ## Resolution
 
@@ -91,6 +93,35 @@ A post-pass over the finished database, in this order:
 
 Every ref stores its resolution class, so you can measure the index instead of
 trusting it.
+
+## Read what the author wrote
+
+Most of what explains a function is not in its body. `ken` reads the comment
+above each declaration as it parses, so a symbol page shows the author's own
+words above the code, and so prose becomes searchable:
+
+    docs  3832/13712 public entities documented (27.9%), 795 cross-references resolved
+
+Four conventions, one code path: Doxygen (`/** */`, `///`, `\brief`), Javadoc
+(`/** */`, `@param`, `{@link Foo}`), Python docstrings, and JSDoc/GoDoc when
+their grammars arrive. No Doxygen run, no Javadoc tool, no docbook to keep in
+sync with the source: the comment is a sibling node in the tree, and the grammar
+already knows where it is. Text is cleaned at parse time (comment decoration
+stripped, `{@link}` unwrapped), so nothing downstream needs to know the syntax.
+
+Names the documentation points at - `@see dev_close`, `\sa shrink`,
+`{@link Tally}`, `#reset()` - become `doc_links` rows and resolve through the
+same post-pass as ordinary references. Unresolved ones are kept, not dropped:
+"this refers to something outside the corpus" is a useful answer when the target
+is `java.util.Map`. `ken web` renders the block as prose, with tag lines
+(`@param`, `@throws`, `@since`) as a definition list rather than as paragraphs
+that happen to start with an at-sign, and offers `in=docs` search that ranks on
+prose (`bm25`) and highlights the matching phrase.
+
+Measured on two doc-heavy trees (nlohmann/json + gson, 932 files, 16,904
+entities): 27.9% of public entities carry a comment, 795 of the names mentioned
+in documentation resolve inside the index. The remainder are JDK and stdlib
+names, which is the expected shape.
 
 ## Design
 
@@ -119,13 +150,13 @@ DB-derived and re-reads on navigation:
 | `#/` | corpus shape: languages, line counts, resolution mix, biggest packages |
 | `#/files?path=` | the directory tree, one row per file with entity and LOC counts |
 | `#/file/<id>` | source with entity bands, imports, dependents, exports |
-| `#/sym/<id>` | one symbol: declaration site, children, calls in and out, references |
+| `#/sym/<id>` | one symbol: declaration site, its documentation, children, calls in and out, references |
 | `#/graph/<id>?dir=up\|down&depth=` | call graph, bucketed by file so 200 edges stay readable |
 | `#/uml?path=&limit=` | class diagram: packages as panels, inheritance solid, use dashed |
 | `#/packages` | package diagram: one box per directory, arrows for cross-package dependencies |
 | `#/seq/<id>?limit=&depth=` | sequence diagram: an interaction trace out of one operation, one lifeline per class |
 | `#/diagrams` | hub for the three diagram views, with the entry points ranked by distinct call targets |
-| `#/search?q=&in=symbols\|files` | full-text search over names, qualified names, and paths |
+| `#/search?q=&in=symbols\|docs\|files` | full-text search over names, documentation prose, and paths |
 
 Two things worth knowing about the diagrams. The class diagram selects a
 *connected* neighbourhood by breadth-first walk from the structurally busiest
@@ -200,6 +231,12 @@ unique per package (`Name_2`) rather than dropping classes on collision, and
   type. Fixing that needs a type checker, which is the clang dependency this tool
   exists to avoid. 50 files in that corpus also index zero entities, because
   their entire content is a macro argument (`TEST_CASE("...") { ... }`).
+* Documentation is read where the convention is regular, which is most of the
+  time but not all of it: a project that documents its API in a separate
+  `.rst`/`.md`/docbook tree is invisible here, and a comment separated from its
+  declaration by a preprocessor block attaches to whatever node follows it.
+  `@see Foo` resolves to the unique in-scope `Foo`; when several definitions
+  share the name the first declaration wins, with no ambiguity counter.
 * Prototypes and definitions share an entity kind and are told apart by the
   `decl` flag, so `sym` on a header prototype and on its definition are the same
   symbol only when the qualname matches exactly.
