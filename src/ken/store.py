@@ -153,6 +153,8 @@ CALLEE = frozenset((
     "function", "method", "decl_function", "decl_method", "macro",
     "class", "struct", "interface", "enum",
 ))
+# The kinds a member call can be written inside.
+TYPE_KINDS = frozenset(("class", "struct", "interface", "union", "enum"))
 
 
 def prune_macro_phantoms(con: sqlite3.Connection) -> int:
@@ -217,86 +219,227 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
         ent_kind[eid] = ekind
 
     stats = {"exact": 0, "scoped": 0, "unique": 0, "ambiguous": 0,
-             "external": 0, "unresolved": 0}
+             "dispatch": 0, "preprocessor": 0, "overload": 0, "external": 0, "unresolved": 0}
     updates = []
     rows = con.execute("SELECT id,src_file,src_entity,kind,target FROM refs").fetchall()
-    for rid, fid, sid, kind, target in rows:
-        mine = fam(lang_of.get(fid, ""))
 
-        cands = by_qual.get((mine, target)) or by_qual.get((mine, target.replace(".", "::")))
-        how = "exact"
-        # `String::new` in Rust must not resolve to an in-tree `new`: the head of
-        # a qualified target decides whether the tail is worth a global lookup.
-        head = target.rsplit("::", 1)[0] if "::" in target else ""
-        spec = spec_by_fam.get(mine)
-        outside_head = bool(head) and spec is not None and bool(spec.member_sep) \
-            and _outside(spec, head)
-        if not cands and "::" in target and not outside_head:
-            # A Rust path states the module it goes through (`crate::tests::memchr::
-            # Runner::new`), which the qualname in the index does not repeat.  Try
-            # the path minus its head, longest first, and take the longest answer:
-            # a shorter suffix that matches several scopes says nothing.
-            parts = target.split("::")
-            for i in range(1, len(parts)):
-                hit = by_qual.get((mine, "::".join(parts[i:])))
-                if hit:
-                    cands = hit
-                    break
+    # Inheritance is resolved first.  `Base::tick` called from `Derived::run`
+    # can only be judged once the class hierarchy exists, and that hierarchy is
+    # itself a set of refs, so a single pass would judge every member call
+    # against a graph that is still half empty.
+    ancestors: dict[str, set[str]] = {}
+    chain_cache: dict[str, set[str]] = {}
+    id_by_qual: dict[str, int] = {}
+    for eid, (_fid, _q) in ent_info.items():
+        id_by_qual.setdefault(_q, eid)
 
-        if not cands and "::" not in target:
-            cands = by_name.get((mine, target))
-            how = "unique"
-        if not cands and "::" in target and not outside_head:
-            cands = by_name.get((mine, target.rsplit("::", 1)[-1]))
-            how = "unique"
-        if cands and len(cands) > 1:
-            # a definition beats a same-name declaration in a header
-            defs = [c for c in cands if not ent_decl.get(c)]
-            if len(defs) == 1:
-                cands = defs
-        if cands and len(cands) > 1:
-            same_file = [c for c in cands if ent_info[c][0] == fid]
-            if len(same_file) == 1:
-                cands, how = same_file, "scoped"
+    def caller_type(sid) -> str:
+        """The class-like entity the reference is written inside, if any.
+
+        A bare call inside a method is aimed at a member of whatever the
+        receiver is.  A bare call inside a free function is aimed at a name in
+        a namespace, and the same-file test is the right one there.
+        """
+        myq = ent_info.get(sid, (0, ""))[1] if sid is not None else ""
+        owner = myq.rsplit("::", 1)[0] if "::" in myq else ""
+        if not owner:
+            return ""
+        ok = ent_kind.get(id_by_qual.get(owner, -1))
+        return owner if ok in TYPE_KINDS else ""
+
+    def chain_of(owner: str) -> set[str]:
+        hit = chain_cache.get(owner)
+        if hit is not None:
+            return hit
+        out: set[str] = set()
+        stack = [owner]
+        while stack:
+            x = stack.pop()
+            for p in ancestors.get(x, ()):
+                if p not in out:
+                    out.add(p)
+                    stack.append(p)
+        chain_cache[owner] = out
+        return out
+
+    def _within(owner: str) -> set[str]:
+        # The enclosing class answers to its own members: `f.Parse` written
+        # inside a FlagSet method reaches FlagSet::Parse, which is not an
+        # ancestor of FlagSet and would otherwise look out of reach.
+        return chain_of(owner) | {owner}
+
+    def in_scope(cands, fid, sid) -> bool:
+        """Is any candidate reachable from the call site at all?
+
+        Same file, same package directory, or a member of the enclosing class
+        or one of its bases.  `False` means every candidate is a coincidence of
+        naming, which is a different statement from "several choices".
+        """
+        here = file_dir.get(fid, "\x00")
+        myq = ent_info.get(sid, (0, ""))[1] if sid is not None else ""
+        owner = myq.rsplit("::", 1)[0] if "::" in myq else ""
+        chain = _within(owner) if owner else set()
+        for c in cands:
+            cf, cq = ent_info[c]
+            if cf == fid or file_dir.get(cf) == here:
+                return True
+            if cq.rsplit("::", 1)[0] in chain:
+                return True
+        return False
+
+    order = ([r for r in rows if r[3] == "inherit"],
+             [r for r in rows if r[3] != "inherit"])
+    for batch in order:
+        for rid, fid, sid, kind, target in batch:
+            mine = fam(lang_of.get(fid, ""))
+
+            spec = spec_by_fam.get(mine)
+            spec_sep = (spec.member_sep if spec else "") or ""
+            # An unqualified target is a name, not a path.  `x.data()` names a
+            # member of whatever x is; it is not the global `data` of some
+            # unrelated header, and looking a bare name up in the
+            # qualified-name index is how a member call came to be pinned to
+            # one.  Only a qualified target may claim an exact qualname; a bare
+            # one is settled by its name and by the scopes around the call.
+            qualified = "::" in target or bool(spec_sep and spec_sep in target)
+            cands = ((by_qual.get((mine, target))
+                      or by_qual.get((mine, target.replace(".", "::"))))
+                     if qualified else None)
+            how = "exact"
+            # `String::new` in Rust must not resolve to an in-tree `new`: the head of
+            # a qualified target decides whether the tail is worth a global lookup.
+            head = target.rsplit("::", 1)[0] if "::" in target else ""
+            outside_head = bool(head) and spec is not None and bool(spec.member_sep) \
+                and _outside(spec, head)
+            if not cands and "::" in target and not outside_head:
+                # A Rust path states the module it goes through (`crate::tests::memchr::
+                # Runner::new`), which the qualname in the index does not repeat.  Try
+                # the path minus its head, longest first, and take the longest answer:
+                # a shorter suffix that matches several scopes says nothing.
+                parts = target.split("::")
+                for i in range(1, len(parts)):
+                    hit = by_qual.get((mine, "::".join(parts[i:])))
+                    if hit:
+                        cands, how = hit, "scoped"
+                        break
+
+            if not cands and "::" not in target:
+                cands = by_name.get((mine, target))
+                how = "unique"
+            if not cands and "::" in target and not outside_head:
+                cands = by_name.get((mine, target.rsplit("::", 1)[-1]))
+                how = "unique"
+            if cands and len(cands) > 1:
+                # a definition beats a same-name declaration in a header
+                defs = [c for c in cands if not ent_decl.get(c)]
+                if len(defs) == 1:
+                    cands = defs
+            if cands and len(cands) > 1:
+                same_file = [c for c in cands if ent_info[c][0] == fid]
+                if len(same_file) == 1:
+                    cands, how = same_file, "scoped"
+                else:
+                    # same directory (one package / module): stronger than a bare
+                    # global name match, weaker than an exact qualname
+                    here = file_dir.get(fid, "\x00")
+                    same_dir = [c for c in cands if file_dir.get(ent_info[c][0]) == here]
+                    if len(same_dir) == 1:
+                        cands, how = same_dir, "scoped"
+                if len(cands) > 1 and sid is not None:
+                    myq = ent_info.get(sid, (0, ""))[1]
+                    prefix = myq.rsplit("::", 1)[0] + "::" if "::" in myq else ""
+                    same_scope = [c for c in cands if prefix and ent_info[c][1].startswith(prefix)]
+                    if len(same_scope) == 1:
+                        cands, how = same_scope, "scoped"
+                if len(cands) > 1 and sid is not None:
+                    # One level up the hierarchy: a method inherited from a base
+                    # class is declared once, in the base, and is neither a file
+                    # nor a scope match when the call is written in the derived
+                    # class.
+                    myq = ent_info.get(sid, (0, ""))[1]
+                    owner = myq.rsplit("::", 1)[0] if "::" in myq else ""
+                    chain = chain_of(owner) if owner else set()
+                    near = [c for c in cands if ent_info[c][1].rsplit("::", 1)[0] in chain]
+                    if len(near) == 1:
+                        cands, how = near, "scoped"
+            if cands and kind == "call":
+                # A name can be carried by something that cannot be called: a
+                # typedef, a field, a namespace.  Finding the name is then not
+                # finding the callee, and saying "ambiguous" would hide that.
+                cands = [c for c in cands if ent_kind.get(c) in CALLEE]
+            elif cands:
+                # Every non-call reference names a type: `new C()`, `extends C`,
+                # `struct S : B`.  Constructors carry their class's name in
+                # Java and C++, so without this a type reference is outvoted by
+                # its own constructors and reads as an ambiguity about scope.
+                typed = [c for c in cands if ent_kind.get(c) in TYPE_KINDS]
+                if typed:
+                    cands = typed
+            n = len(cands) if cands else 0
+            if not cands:
+                # A call the tree does not contain is only a failure if the name is
+                # meant to be in the tree.  Platform names (libc, the C++ standard
+                # library, the JDK, assertion DSLs) are targets that by definition
+                # live outside it.  This test runs only after the in-tree lookup
+                # fails, so a corpus that ships its own copy of libc still wins.
+                # Nothing in the corpus answers to this name at all, so whatever
+                # the call is aimed at was never in the tree (Catch2, the JDK, a
+                # system header).  Only a name the corpus *does* define, but which
+                # cannot be pinned to one definition, is a gap in the analysis.
+                in_tree = (mine, target.rsplit("::", 1)[-1]) in by_name
+                kind_of = ("external" if (outside_head or not in_tree
+                                          or _outside(spec, target))
+                           else "unresolved")
+                updates.append((None, kind_of, 0, rid))
+            elif n == 1:
+                # "exact" means the resolved entity answers to exactly the text
+                # of the reference.  A bare name that landed on a global of that
+                # name is a name match, not a path match, and saying otherwise
+                # would flatter the numbers.
+                kind_of = how if ent_info[cands[0]][1] == target else (how if how != "exact" else "unique")
+                updates.append((cands[0], kind_of, 1, rid))
+                if kind == "inherit" and sid is not None:
+                    ancestors.setdefault(ent_info[sid][1], set()).add(ent_info[cands[0]][1])
             else:
-                # same directory (one package / module): stronger than a bare
-                # global name match, weaker than an exact qualname
-                here = file_dir.get(fid, "\x00")
-                same_dir = [c for c in cands if file_dir.get(ent_info[c][0]) == here]
-                if len(same_dir) == 1:
-                    cands, how = same_dir, "scoped"
-            if len(cands) > 1 and sid is not None:
-                myq = ent_info.get(sid, (0, ""))[1]
-                prefix = myq.rsplit("::", 1)[0] + "::" if "::" in myq else ""
-                same_scope = [c for c in cands if prefix and ent_info[c][1].startswith(prefix)]
-                if len(same_scope) == 1:
-                    cands, how = same_scope, "scoped"
-        if cands and kind == "call":
-            # A name can be carried by something that cannot be called: a
-            # typedef, a field, a namespace.  Finding the name is then not
-            # finding the callee, and saying "ambiguous" would hide that.
-            cands = [c for c in cands if ent_kind.get(c) in CALLEE]
-        n = len(cands) if cands else 0
-        if not cands:
-            # A call the tree does not contain is only a failure if the name is
-            # meant to be in the tree.  Platform names (libc, the C++ standard
-            # library, the JDK, assertion DSLs) are targets that by definition
-            # live outside it.  This test runs only after the in-tree lookup
-            # fails, so a corpus that ships its own copy of libc still wins.
-            # Nothing in the corpus answers to this name at all, so whatever
-            # the call is aimed at was never in the tree (Catch2, the JDK, a
-            # system header).  Only a name the corpus *does* define, but which
-            # cannot be pinned to one definition, is a gap in the analysis.
-            in_tree = (mine, target.rsplit("::", 1)[-1]) in by_name
-            kind_of = ("external" if (outside_head or not in_tree
-                                      or _outside(spec, target))
-                       else "unresolved")
-            updates.append((None, kind_of, 0, rid))
-        elif n == 1:
-            updates.append((cands[0], how, 1, rid))
-        else:
-            updates.append((None, "ambiguous", n, rid))
-        stats[kind_of if not cands else ("ambiguous" if n > 1 else how)] += 1
+                # A many-candidate name that is none of them, twice over.
+                if all(ent_kind.get(c) == "macro" for c in cands):
+                    # A macro is text, not a name: the last #define wins at
+                    # inclusion time, and nothing in the index knows that order.
+                    kind_of = "preprocessor"
+                elif len({ent_info[c][1] for c in cands}) == 1 and kind == "call":
+                    # Every candidate carries the same qualified name: one
+                    # declaration site seen through several signatures.  Which
+                    # signature a call reaches is a question about argument
+                    # types, so the site is known even though the body is not,
+                    # and calling that "ambiguous" would say we do not know
+                    # where the name lives when we do.
+                    kind_of = "overload"
+                elif len({ent_info[c][1] for c in cands}) == 1:
+                    # A non-call reference has no signature to pick: several rows
+                    # under one qualified name (two `impl` blocks, a declaration
+                    # and its definition) are one place, not an overload set.
+                    kind_of = "unique"
+                elif kind == "call" and caller_type(sid) and not any(
+                        ent_info[c][1].rsplit("::", 1)[0] in _within(caller_type(sid))
+                        for c in cands):
+                    # Written in a method, and nothing in the enclosing class or
+                    # its bases answers to the name: the receiver's type lives
+                    # outside the tree (`size` on a std::string).  Calling that
+                    # ambiguous claims a choice between candidates that were
+                    # never candidates.
+                    kind_of = "dispatch"
+                elif kind == "call" and not in_scope(cands, fid, sid):
+                    # The name exists in the corpus but nothing in scope declares
+                    # it: the receiver's type lives outside it (`size` called on
+                    # a std::string from a header-only library).  Calling that
+                    # ambiguous claims a choice between candidates that were
+                    # never candidates.
+                    kind_of = "dispatch"
+                else:
+                    kind_of = "ambiguous"
+                updates.append((None, kind_of, n, rid))
+            stats[kind_of] = stats.get(kind_of, 0) + 1
+
     con.executemany("UPDATE refs SET target_id=?,resolution=?,candidates=? WHERE id=?", updates)
     con.commit()
     return stats
