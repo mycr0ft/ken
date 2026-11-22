@@ -205,10 +205,17 @@ def name_of(node, src) -> tuple[str, str]:
     if t in IDENT_TYPES:
         return "", text(src, node)
     if t == "qualified_identifier":
-        # 'A::B::f' -> ('A::B', 'f')
+        # 'A::B::f' -> ('A::B', 'f').  A root-qualified '::A::B::f' nests the
+        # whole path in `name` with no `scope` field, so it is read recursively
+        # rather than by splitting the text: splitting gave ('::A', 'A::B::f'),
+        # and the caller's prefix+name join then spelled 'A' twice.
         name = node.child_by_field_name("name")
         scope = node.child_by_field_name("scope")
-        short = text(src, name) if name is not None else strip_template(text(src, node)).split("::")[-1]
+        if name is None:
+            return "", strip_template(text(src, node)).rsplit("::", 1)[-1]
+        if scope is None and name.type == "qualified_identifier":
+            return name_of(name, src)
+        short = text(src, name)
         pre = strip_template(text(src, scope)) if scope is not None else strip_template(text(src, node)).rsplit("::", 1)[0]
         return pre, short
     if t == "destructor_name":
@@ -270,6 +277,12 @@ class Builder:
 
     # -- entities
     def qual(self, name: str, prefix: str = "") -> str:
+        if name.startswith("::"):
+            # A leading `::` is an absolute name: the source has already said
+            # where it lives, and prefixing it with the enclosing scope describes
+            # a place that does not exist (`::a::b` inside `a::b` became
+            # `a::b::a::b`).
+            return name[2:]
         parts = [self.ents[i]["name"] for i in self.stack] + list(self.owner)
         if prefix:
             parts.append(prefix)
