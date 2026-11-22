@@ -214,13 +214,19 @@ def test_python_docstring_is_doc_not_body(con):
     assert '"""' not in doc, doc
 
 
-@pytest.mark.parametrize("path", ["bump.go", "join.js"])
-def test_doc_languages_arrive_with_their_grammars(con, path):
-    """GoDoc and JSDoc are read by the same code path, but only once the
-    grammar is wired into the language table.  Until then the file is tallied
-    as unreadable rather than silently indexed as an empty file."""
-    rows = q(con, "SELECT 1 FROM files WHERE path LIKE ?", f"%{path}")
-    assert not rows, f"{path} is indexed without a language table entry"
+def test_godoc_text_arrives_with_the_grammar(con):
+    """GoDoc is the same comment shape as Javadoc's `//`, so once `.go` has a
+    language record its comments are read by the existing pipeline."""
+    rows = q(con, "SELECT name, doc FROM entities WHERE name = 'Bump'")
+    assert rows, "bump.go is not indexed even though go is wired"
+    assert "adds one to n" in rows[0][1], rows
+
+
+def test_jsdoc_still_waits_for_its_grammar(con):
+    """JSDoc is regular enough too, but `.js` has no language record yet, and a
+    file that is silently indexed as empty teaches the user something false."""
+    rows = q(con, "SELECT 1 FROM files WHERE path LIKE '%join.js'")
+    assert not rows, "join.js is indexed without a language table entry"
 
 
 def test_entities_without_docs_say_so(con):

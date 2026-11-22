@@ -166,11 +166,11 @@ def test_unindexed_languages_are_tallied_not_ignored(tmp_path):
     from ken.cli import iter_sources
 
     (tmp_path / "a.c").write_text("int f(void) { return 0; }\n")
-    (tmp_path / "b.rs").write_text("fn f() {}\n")
-    (tmp_path / "c.go").write_text("package p\n")
+    (tmp_path / "b.kt").write_text("fun f() {}\n")
+    (tmp_path / "c.ex").write_text("def f, do: nil\n")
     (tmp_path / "notes.md").write_text("# not code\n")
     skipped = collections.Counter()
     got = list(iter_sources([str(tmp_path)], skipped))
     assert [os.path.basename(p) for p, _ in got] == ["a.c"], got
-    assert skipped[".rs"] == 1 and skipped[".go"] == 1, skipped
+    assert skipped[".kt"] == 1 and skipped[".ex"] == 1, skipped
     assert ".md" not in skipped, "documentation is not a missing language"
