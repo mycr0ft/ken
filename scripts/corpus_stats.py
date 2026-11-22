@@ -16,7 +16,11 @@ from __future__ import annotations
 import sqlite3
 import sys
 
-HITS = ("exact", "scoped", "unique")
+# An overload set is one declaration site with several signatures: the name is
+# located, the body is not.  That is a hit on "where does this live", which is
+# what this column measures, so it counts here and is broken out below.
+HITS = ("exact", "scoped", "unique", "overload")
+RUNGS = ("overload", "dispatch", "preprocessor")
 
 
 def one(path: str) -> dict:
@@ -53,6 +57,9 @@ def main(argv: list[str]) -> int:
         print(f"        {100.0 * hits / max(d['refs'], 1):.1f}% of all refs, "
               f"{100.0 * hits / max(intree, 1):.1f}% of the {intree:,} in-tree refs")
         print("  kinds " + "  ".join(f"{k}={v:,}" for k, v in d["kinds"]))
+        rungs = {k: d["res"].get(k, 0) for k in RUNGS}
+        if any(rungs.values()):
+            print("  rungs " + "  ".join(f"{k}={v:,}" for k, v in rungs.items()))
         if d["amb"]:
             print("  amb   " + "  ".join(f"{k}={v:,}" for k, v in d["amb"]))
         print(f"  empty {len(d['empty'])} files with no entities")
