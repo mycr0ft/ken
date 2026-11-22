@@ -16,8 +16,10 @@ from dataclasses import dataclass
 import tree_sitter as ts
 import tree_sitter_c
 import tree_sitter_cpp
+import tree_sitter_go
 import tree_sitter_java
 import tree_sitter_python
+import tree_sitter_rust
 
 # Extensions and grammars are not listed here: they are fields of the language
 # records at the bottom of this file, so a language cannot be half-registered
@@ -219,6 +221,17 @@ def name_of(node, src) -> tuple[str, str]:
         return name_of(node.child_by_field_name("name"), src)
     if t == "template_type":
         return name_of(node.child_by_field_name("name"), src)
+    if t == "scoped_identifier":
+        # Rust 'Circle::new' -> ('Circle', 'new'); the prefix lets the resolver
+        # see the qualifier instead of guessing from the member name alone.
+        name = node.child_by_field_name("name")
+        path = node.child_by_field_name("path")
+        if name is not None:
+            short = text(src, name)
+            pre = strip_template(text(src, path)) if path is not None else ""
+            # `Vec::<u8>::with_capacity` keeps the turbofish's separator behind
+            return pre.rstrip(":"), short
+        return "", strip_template(text(src, node)).rsplit("::", 1)[-1]
     if t == "field_expression":
         # obj.method / ptr->method
         return name_of(node.child_by_field_name("field"), src)
@@ -251,11 +264,13 @@ class Builder:
         self.refs: list[dict] = []
         self.deps: list[dict] = []
         self.stack: list[int] = []
+        self.owner: list[str] = []           # owner scopes with no entity of their own
+        self.self_prefixes: tuple[str, ...] = ()   # `Self`, `self` in a member target
         self._by_node: dict[int, int] = {}   # id(node) -> entity index
 
     # -- entities
     def qual(self, name: str, prefix: str = "") -> str:
-        parts = [self.ents[i]["name"] for i in self.stack]
+        parts = [self.ents[i]["name"] for i in self.stack] + list(self.owner)
         if prefix:
             parts.append(prefix)
         parts.append(name)
@@ -265,8 +280,10 @@ class Builder:
         decl = 1 if kind.startswith("decl_") else 0
         if decl:
             kind = kind[5:]
-        if kind in ("function", "method") and self.stack and \
-                self.ents[self.stack[-1]]["kind"] in ("class", "struct", "interface", "enum"):
+        ownered = self.owner or (self.stack and
+                                 self.ents[self.stack[-1]]["kind"] in
+                                 ("class", "struct", "interface", "enum"))
+        if kind in ("function", "method") and ownered:
             kind = "method"
         e = {
             "kind": kind,
@@ -285,6 +302,19 @@ class Builder:
         return len(self.ents) - 1
 
     CLASSY = ("class", "struct", "interface", "enum")
+
+    def ent_index(self, name: str, kinds=None):
+        """Index of the last entity with this name (and kind), or None.
+
+        Post-passes that run after the walk use this when the owning entity is
+        not an ancestor of the node: a Rust `impl` block owns methods in
+        whatever file the struct is declared in.
+        """
+        for i in range(len(self.ents) - 1, -1, -1):
+            e = self.ents[i]
+            if e["name"] == name and (kinds is None or e["kind"] in kinds):
+                return i
+        return None
 
     def class_of(self, node):
         """Index of the nearest enclosing class/struct/interface entity (or None)."""
@@ -588,6 +618,9 @@ def _drive(b: Builder, node, spec) -> None:
         if op == "pop":  # leaving an entity scope
             b.stack.pop()
             continue
+        if op == "unscope":  # leaving a named owner with no entity of its own
+            b.owner.pop()
+            continue
         act = spec.get(n.type)
         if act is None:
             work.extend(visit(n))
@@ -596,7 +629,17 @@ def _drive(b: Builder, node, spec) -> None:
         if kind == "ent":
             _, ekind, namer = act[:3]
             pred = act[3] if len(act) > 3 else None
-            prefix, name = ("", "") if (pred is not None and not pred(n)) else namer(n, b.src)
+            if pred is not None and not pred(n):
+                work.extend(visit(n))
+                continue
+            got = namer(n, b.src)
+            if ekind is None:
+                # The declaration names its own kind: Go's `type X struct{}` and
+                # `type X interface{}` are one node type with two entity kinds.
+                ekind, name = got
+                prefix = ""
+            else:
+                prefix, name = got
             if not name or (ekind in CALLABLE and not _declarator_ok(n)):
                 work.extend(visit(n))
                 continue
@@ -606,12 +649,26 @@ def _drive(b: Builder, node, spec) -> None:
         elif kind == "ref":
             _, rkind, namer = act
             prefix, target = namer(n, b.src)
-            b.add_ref(rkind, (prefix + "::" + target) if prefix and target else target,
+            if prefix and prefix in b.self_prefixes:
+                # `Self::new` inside an `impl` names the enclosing type, which
+                # the parse table cannot see; the scope stack can.
+                prefix = b.owner[-1] if b.owner else ""
+            b.add_ref(rkind, (prefix + "::" + target) if prefix else target,
                       n.start_point[0])
             work.extend(visit(n))
         elif kind == "dep":
             _, _dkind, getter = act
             b.add_dep(_dkind, getter(n, b.src))
+            work.extend(visit(n))
+        elif kind == "scope":
+            # A named scope that is not itself an entity: Rust `impl Circle`
+            # owns methods that should read `Circle::new`, but there is no
+            # entity to open.
+            _, namer = act
+            owner = namer(n, b.src)
+            if owner:
+                b.owner.append(owner)
+                work.append(("unscope", None))
             work.extend(visit(n))
         else:  # transparent wrapper (template_declaration, decorated_definition)
             work.extend(visit(n))
@@ -696,6 +753,7 @@ def extract(path: str, lang: str, src: bytes) -> Builder:
     tree = parser.parse(src)
     root = tree.root_node
     b = Builder(path, lang, src)
+    b.self_prefixes = spec.self_prefixes
     _drive(b, root, spec.spec)
     # imports/inheritance come after the main walk: inherit edges want the
     # owning class entity to already exist.  Which passes run, and in what
@@ -799,6 +857,270 @@ verify when thenReturn thenThrow mock spy given expectAny
 # extract() and reports, which makes "wired" a test result rather than a claim.
 
 
+# ---------------------------------------------------------------- go / rust
+#
+# Both languages put declarations inside scopes that are not entities of their
+# own (Go: nothing; Rust: `impl`), and both spell an import as a path rather
+# than a dotted module name.  The records below keep that knowledge here so
+# store.py only ever sees separators and suffixes.
+
+def _bare_type(s: str) -> str:
+    """`&mut Circle<T>` -> `Circle`; the type a scope or base actually names."""
+    s = s.strip().strip("&").strip()
+    if s.startswith("mut "):
+        s = s[4:]
+    s = strip_template(s)
+    return s.rsplit("::", 1)[-1].strip()
+
+
+def _go_method_prefix(node, src):
+    """`func (c *Circle) Area()` -> `Circle`.
+
+    A Go method's receiver is its owner: there is no class body to nest in, so
+    the qualifier has to come from the receiver's type.
+    """
+    recv = node.child_by_field_name("receiver")
+    s = text(src, recv) if recv is not None else ""
+    s = s.strip().strip("()").replace("*", " ").split()
+    return _bare_type(s[-1]) if s else ""
+
+
+def _go_method(node, src):
+    nm = node.child_by_field_name("name")
+    return _go_method_prefix(node, src), (text(src, nm) if nm is not None else "")
+
+
+def _go_type_spec(node, src):
+    """(kind, name) for `type X struct{}` / `interface{}` / alias."""
+    nm = node.child_by_field_name("name")
+    ty = node.child_by_field_name("type")
+    tt = ty.type if ty is not None else ""
+    kind = {"struct_type": "struct", "interface_type": "interface"}.get(tt, "alias")
+    return kind, (text(src, nm) if nm is not None else "")
+
+
+def _go_iface_method(node, src):
+    nm = node.child_by_field_name("name") or first_child(node, "field_identifier")
+    return "", (text(src, nm) if nm is not None else "")
+
+
+def _go_call(node, src):
+    """`fmt.Println(..)` -> `Println`: a Go call names the member, not the package.
+
+    The package or receiver in front of the dot is a value with no entity, so a
+    qualified target would only add a qualifier the tree cannot resolve.
+    """
+    fn = node.child_by_field_name("function")
+    if fn is not None and fn.type == "selector_expression":
+        return name_of(fn.child_by_field_name("field"), src)
+    return name_of(fn, src)
+
+
+def _go_composite(node, src):
+    return name_of(node.child_by_field_name("type"), src)
+
+
+def _go_imports(b: Builder, root) -> None:
+    src = b.src
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "import_spec":
+            p = n.child_by_field_name("path")
+            if p is not None:
+                b.add_dep("import", text(src, p).strip('`"'))
+        stack.extend(n.named_children)
+
+
+def _go_embeds(b: Builder, root) -> None:
+    """`type Circle struct { Shape }` -> an inherit edge owned by Circle."""
+    src = b.src
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "type_spec":
+            ty = n.child_by_field_name("type")
+            nm = n.child_by_field_name("name")
+            if ty is not None and ty.type == "struct_type" and nm is not None:
+                owner = b.ent_index(text(src, nm), ("struct",))
+                for fld in _descend(ty, "field_declaration"):
+                    if fld.child_by_field_name("name") is not None:
+                        continue
+                    t = fld.child_by_field_name("type")
+                    if t is not None:
+                        b.add_ref("inherit", _bare_type(text(src, t)).lstrip("*"),
+                                  fld.start_point[0], owner)
+        stack.extend(n.named_children)
+
+
+def _descend(node, want: str):
+    stack = list(node.named_children)
+    while stack:
+        n = stack.pop()
+        if n.type == want:
+            yield n
+        stack.extend(n.named_children)
+
+
+def _rs_impl_owner(node, src):
+    ty = node.child_by_field_name("type")
+    return _bare_type(text(src, ty)) if ty is not None else ""
+
+
+def _rs_fn(node, src):
+    nm = node.child_by_field_name("name")
+    return "", (text(src, nm) if nm is not None else "")
+
+
+def _rs_mod_level(node):
+    """A `const` written inside a function body is an implementation detail of
+    that function, not a name the reader of the module needs to find."""
+    p = node.parent
+    while p is not None:
+        if p.type in ("function_item", "closure_expression"):
+            return False
+        p = p.parent
+    return True
+
+
+def _rs_call(node, src):
+    """`self.shed()` names a method of the enclosing impl, which the resolver
+    can only see if the receiver is kept as a prefix; other receivers are left
+    bare because a local variable name is not a type."""
+    fn = node.child_by_field_name("function")
+    if fn is not None and fn.type == "field_expression":
+        recv = fn.child_by_field_name("value")
+        if recv is not None and text(src, recv).strip() in ("self", "Self"):
+            return "self", name_of(fn.child_by_field_name("field"), src)[1]
+    return name_of(fn, src)
+
+
+def _rs_macro_call(node, src):
+    m = node.child_by_field_name("macro")
+    return "", (text(src, m) if m is not None else "")
+
+
+def _rs_uses(b: Builder, root) -> None:
+    """`use` paths, one dependency per imported name.
+
+    `use std::collections::{HashMap, HashSet as HS}` is two imports; the alias
+    is not part of the path.  `crate`/`self`/`super` name the tree, so they stay
+    as written and the resolver strips them from the record's module roots.
+    """
+    src = b.src
+    for n in _descend(root, "use_declaration"):
+        arg = n.child_by_field_name("argument")
+        txt = text(src, arg).strip() if arg is not None else ""
+        if not txt:
+            continue
+        if "{" in txt:
+            base, _, rest = txt.partition("{")
+            base = base.strip().rstrip(":").rstrip(":")
+            for item in rest.split("}")[0].split(","):
+                item = item.strip().split(" as ")[0].strip().strip("*").strip()
+                if item:
+                    b.add_dep("use", f"{base}::{item}" if base else item)
+        else:
+            raw = txt.split(" as ")[0].strip().rstrip("*").rstrip(":")
+            b.add_dep("use", raw)
+
+
+def _rs_mods(b: Builder, root) -> None:
+    """`mod inner;` is a file dependency; `mod inner { .. }` is not."""
+    src = b.src
+    for n in _descend(root, "mod_item"):
+        if n.child_by_field_name("body") is not None:
+            continue
+        nm = n.child_by_field_name("name")
+        if nm is not None:
+            b.add_dep("mod", text(src, nm))
+
+
+def _rs_inherits(b: Builder, root) -> None:
+    """`impl Shape for Circle` -> an inherit edge owned by Circle."""
+    src = b.src
+    for n in _descend(root, "impl_item"):
+        trait = n.child_by_field_name("trait")
+        if trait is None:
+            continue
+        owner_name = _rs_impl_owner(n, src)
+        target = _bare_type(text(src, trait))
+        owner = b.ent_index(owner_name, Builder.CLASSY) if owner_name else None
+        if target:
+            b.add_ref("inherit", target, trait.start_point[0], owner)
+
+
+GO_BUILTINS = frozenset("""
+len cap make new append copy delete panic recover print println close complex
+real imag min max clear
+""".split())
+
+#: first segment of a standard-library import path: `fmt.Println` in a repo
+#: that defines its own `Println` is still the standard library's.
+GO_PKGS = frozenset("""
+fmt strings strconv os io bufio bytes errors sort sync sync/atomic time path
+path/filepath regexp reflect math math/bits net net/http net/url flag testing
+context log log/slog encoding encoding/json encoding/binary unicode unicode/utf8
+runtime unsafe syscall hash crypto crypto/sha256 crypto/rand debug go html
+index mime plugin text text/template container database embed image archive
+compress slices maps cmp iter unique
+""".split())
+
+RUST_STD = frozenset("""
+std core alloc proc_macro test self crate super
+String Vec Box Option Result HashMap HashSet BTreeMap BTreeSet VecDeque
+LinkedList BinaryHeap Path PathBuf File OsStr OsString CString CStr Arc Rc Weak
+Cell RefCell Mutex RwLock Cow Pin PhantomData Duration Instant SystemTime
+Ordering Range RangeInclusive Iterator IntoIterator ExactSizeIterator
+DoubleEndIterator Display Debug Clone Copy Default PartialEq PartialOrd Eq Ord
+Hash Send Sync Sized Unpin From Into TryFrom TryInto AsRef AsMut Borrow
+BorrowMut ToOwned ToString Drop Fn FnMut FnOnce Error Write Read Seek BufRead
+fmt io mem fs thread process str slice env time cmp iter ops ptr num char
+u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64 bool
+println print eprintln eprint format write writeln vec panic assert assert_eq
+assert_ne todo unimplemented unreachable matches dbg include_str include_bytes
+stringify concat
+""".split())
+
+SPEC["go"] = {
+    "function_declaration": ("ent", "function", _rs_fn),
+    "method_declaration": ("ent", "method", _go_method),
+    "type_spec": ("ent", None, _go_type_spec),          # kind comes from the type
+    "type_alias": ("ent", "alias", _rs_fn),
+    "method_elem": ("ent", "decl_method", _go_iface_method),
+    "call_expression": ("ref", "call", _go_call),
+    "composite_literal": ("ref", "instantiate", _go_composite),
+}
+
+SPEC["rust"] = {
+    "function_item": ("ent", "function", _rs_fn),
+    "function_signature_item": ("ent", "decl_method", _rs_fn),
+    "struct_item": ("ent", "struct", _rs_fn),
+    "enum_item": ("ent", "enum", _rs_fn),
+    "union_item": ("ent", "union", _rs_fn),
+    "trait_item": ("ent", "interface", _rs_fn),
+    "type_item": ("ent", "alias", _rs_fn),
+    # A `const RANK: [u8; 256]` table is where half this crate's data lives and
+    # it is not a function, so nothing else in the table would ever surface it.
+    "const_item": ("ent", "constant", _rs_fn, _rs_mod_level),
+    "static_item": ("ent", "constant", _rs_fn, _rs_mod_level),
+    "macro_definition": ("ent", "macro", _rs_fn),
+    "impl_item": ("scope", _rs_impl_owner),
+    "call_expression": ("ref", "call", _rs_call),
+    "macro_invocation": ("ref", "call", _rs_macro_call),
+}
+
+DECISIONS["go"] = frozenset({
+    "if_statement", "for_statement", "expression_case", "type_case",
+    "communication_case", "binary_expression",
+})
+
+DECISIONS["rust"] = frozenset({
+    "if_expression", "match_arm", "while_expression", "loop_expression",
+    "for_expression", "binary_expression",
+})
+
+
 @dataclass(frozen=True)
 class LangSpec:
     #: file extensions claimed, lower-case with the dot
@@ -820,6 +1142,25 @@ class LangSpec:
     module_paths: bool = False
     #: extra suffixes tried when resolving an import to a file
     import_suffixes: tuple[str, ...] = ()
+    #: separator between a qualifier and its member when the parse table keeps
+    #: a call target qualified (`Circle::new`).  Empty when the table already
+    #: strips qualifiers, as the C/C++/Java/Python tables do.
+    member_sep: str = ""
+    #: separator inside an import path: `.` for the dotted-module languages,
+    #: `::` for Rust
+    module_sep: str = "."
+    #: leading path components that name the tree itself, not a dependency
+    #: (`crate`, `self`): stripped before probing for a file
+    module_roots: tuple[str, ...] = ()
+    #: heads that name the enclosing scope in a member target (`Self::new`),
+    #: substituted with the owner on the scope stack
+    self_prefixes: tuple[str, ...] = ()
+    #: components to drop from the tail when an import names a member rather
+    #: than a module (`use crate::model::Widget` -> still look for `model/`)
+    import_item_drop: int = 0
+    #: True when an import names a directory of files rather than a file stem,
+    #: as Go package paths do
+    dep_is_dir: bool = False
     #: languages whose entities resolve against each other (C and C++ share a
     #: name space because they interoperate)
     family: str = ""
@@ -903,6 +1244,81 @@ import java.util.List;
 
 public class Greeter extends Base {
     public String greet(List<String> names) { return names.get(0); }
+}
+""",
+    ),
+    "go": LangSpec(
+        exts=(".go",),
+        grammar=tree_sitter_go,
+        spec=SPEC["go"],
+        decisions=frozenset(DECISIONS["go"]),
+        post=(_go_imports, _go_embeds),
+        external=COMMON_EXTERNAL | GO_BUILTINS | GO_PKGS,
+        family="go",
+        # An import is a directory, not a module stem: "github.com/spf13/pflag"
+        # is the package that lives in that directory.
+        dep_is_dir=True,
+        fixture="""
+package demo
+
+import "fmt"
+
+type Shape interface {
+	Area() float64
+}
+
+type Circle struct {
+	Shape
+	r float64
+}
+
+func (c *Circle) Area() float64 { return 3.14 * c.r * c.r }
+
+func main() {
+	c := Circle{r: 1}
+	fmt.Println(c.Area())
+}
+""",
+    ),
+    "rust": LangSpec(
+        exts=(".rs",),
+        grammar=tree_sitter_rust,
+        spec=SPEC["rust"],
+        decisions=frozenset(DECISIONS["rust"]),
+        post=(_rs_uses, _rs_mods, _rs_inherits),
+        external=COMMON_EXTERNAL | RUST_STD,
+        family="rust",
+        # `use crate::model::Widget` names a module plus a member, and `mod
+        # inner;` names a file next to this one.
+        member_sep="::",
+        self_prefixes=("Self", "self"),
+        module_paths=True,
+        module_sep="::",
+        module_roots=("crate", "self", "super"),
+        import_item_drop=1,
+        import_suffixes=(".rs", "/mod.rs"),
+        fixture="""
+use std::fmt;
+
+mod util;
+
+trait Shape {
+    fn area(&self) -> f64;
+}
+
+struct Circle {
+    r: f64,
+}
+
+impl Shape for Circle {
+    fn area(&self) -> f64 {
+        3.14 * self.r * self.r
+    }
+}
+
+fn main() {
+    let c = Circle { r: 1.0 };
+    println!("{}", c.area());
 }
 """,
     ),
