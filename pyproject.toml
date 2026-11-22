@@ -29,8 +29,13 @@ dependencies = [
   "tree-sitter-python",
   "tree-sitter-java",
   "tree-sitter-go",
+  "tree-sitter-javascript",
   "tree-sitter-rust",
 ]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
 
 [project.urls]
 Repository = "https://github.com/mycr0ft/ken"

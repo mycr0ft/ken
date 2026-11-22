@@ -17,4 +17,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv pip install -e . pytest
-      - run: python -m pytest -q
+      - run: python -m pytest -q -rs
+        env:
+          KEN_STRICT_GRAMMARS: "1"
+      - run: ken langs
