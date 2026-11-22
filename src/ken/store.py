@@ -142,7 +142,7 @@ def add_file(con: sqlite3.Connection, path: str, lang: str, src: bytes, b) -> in
 # resolver.  The resolver stays language-blind: it asks the record.
 def _outside(spec, target: str) -> bool:
     """True when the name provably comes from outside the tree's language runtime."""
-    if target in spec.external:
+    if spec is not None and target in spec.external:
         return True
     if target.startswith("std::") or target.startswith("::std::"):
         return True
@@ -225,10 +225,28 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
 
         cands = by_qual.get((mine, target)) or by_qual.get((mine, target.replace(".", "::")))
         how = "exact"
+        # `String::new` in Rust must not resolve to an in-tree `new`: the head of
+        # a qualified target decides whether the tail is worth a global lookup.
+        head = target.rsplit("::", 1)[0] if "::" in target else ""
+        spec = spec_by_fam.get(mine)
+        outside_head = bool(head) and spec is not None and bool(spec.member_sep) \
+            and _outside(spec, head)
+        if not cands and "::" in target and not outside_head:
+            # A Rust path states the module it goes through (`crate::tests::memchr::
+            # Runner::new`), which the qualname in the index does not repeat.  Try
+            # the path minus its head, longest first, and take the longest answer:
+            # a shorter suffix that matches several scopes says nothing.
+            parts = target.split("::")
+            for i in range(1, len(parts)):
+                hit = by_qual.get((mine, "::".join(parts[i:])))
+                if hit:
+                    cands = hit
+                    break
+
         if not cands and "::" not in target:
             cands = by_name.get((mine, target))
             how = "unique"
-        if not cands and "::" in target:
+        if not cands and "::" in target and not outside_head:
             cands = by_name.get((mine, target.rsplit("::", 1)[-1]))
             how = "unique"
         if cands and len(cands) > 1:
@@ -269,7 +287,10 @@ def resolve_refs(con: sqlite3.Connection) -> dict[str, int]:
             # the call is aimed at was never in the tree (Catch2, the JDK, a
             # system header).  Only a name the corpus *does* define, but which
             # cannot be pinned to one definition, is a gap in the analysis.
-            kind_of = "external" if (target not in by_name or _outside(spec_by_fam[mine], target)) else "unresolved"
+            in_tree = (mine, target.rsplit("::", 1)[-1]) in by_name
+            kind_of = ("external" if (outside_head or not in_tree
+                                      or _outside(spec, target))
+                       else "unresolved")
             updates.append((None, kind_of, 0, rid))
         elif n == 1:
             updates.append((cands[0], how, 1, rid))
@@ -309,11 +330,17 @@ def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
     # (/usr/include: 120k deps x 23k paths was the slowest stage by far).
     by_suffix: dict[str, list[int]] = {}
     by_base: dict[str, list[int]] = {}
+    by_dir: dict[str, list[int]] = {}
     for fid, p in paths.items():
         parts = p.split("/")
         for k in range(1, min(6, len(parts)) + 1):
             by_suffix.setdefault("/".join(parts[-k:]), []).append(fid)
         by_base.setdefault(parts[-1], []).append(fid)
+        # A package directory, for languages where an import names a directory
+        # rather than a file stem (Go).  Indexed by suffixes so a module path
+        # can be matched without knowing where the module is checked out.
+        for k in range(1, min(6, len(parts) - 1)):
+            by_dir.setdefault("/".join(parts[-k - 1:-1]), []).append(fid)
     stats = {"resolved": 0, "unresolved": 0}
     updates = []
     lang_of = dict(con.execute("SELECT id,lang FROM files"))
@@ -322,18 +349,39 @@ def resolve_file_deps(con: sqlite3.Connection) -> dict[str, int]:
         cands: list[int] = []
         spec = SPECS.get(lang_of.get(fid, ""))
         # How a language spells a module is a fact in its record: Java and
-        # Python name `a.b` for the file a/b, C and C++ include a path suffix.
-        probe = raw.replace(".", "/") if (spec and spec.module_paths and "/" not in raw) else raw
-        suffixes = (raw,) + ((probe,) if probe != raw else ()) + (
-            tuple(probe + s for s in spec.import_suffixes) if spec else ())
-        for suffix in suffixes:
-            parts = suffix.split("/")
+        # Python name `a.b` for the file a/b, C and C++ include a path suffix,
+        # Rust writes `crate::model::Widget` and Go writes a package directory.
+        probe = raw
+        if spec is not None:
+            if spec.module_paths and spec.module_sep != "/" and "/" not in probe:
+                probe = probe.replace(spec.module_sep, "/")
+            while spec.module_roots:
+                head, sep, rest = probe.partition("/")
+                if sep and head in spec.module_roots:
+                    probe = rest
+                else:
+                    break
+            if spec.import_item_drop:
+                parts = probe.split("/")
+                if len(parts) > spec.import_item_drop:
+                    probe = "/".join(parts[:-spec.import_item_drop])
+        if spec is not None and spec.dep_is_dir:
+            parts = probe.split("/")
             for k in range(min(6, len(parts)), 0, -1):
-                cands = by_suffix.get("/".join(parts[-k:]), [])
+                cands = by_dir.get("/".join(parts[-k:]), [])
                 if cands:
                     break
-            if cands:
-                break
+        if not cands:
+            suffixes = (raw,) + ((probe,) if probe != raw else ()) + (
+                tuple(probe + s for s in spec.import_suffixes) if spec else ())
+            for suffix in suffixes:
+                parts = suffix.split("/")
+                for k in range(min(6, len(parts)), 0, -1):
+                    cands = by_suffix.get("/".join(parts[-k:]), [])
+                    if cands:
+                        break
+                if cands:
+                    break
         if not cands:
             cands = by_base.get(raw.rsplit("/", 1)[-1], []) or \
                 by_base.get(probe.rsplit("/", 1)[-1], [])
