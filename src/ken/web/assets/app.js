@@ -26,11 +26,13 @@ const shortPath = (p, root) => {
 };
 
 const RES_LABEL = {
-  exact: 'exact', scoped: 'scoped', unique: 'unique',
+  exact: 'exact', scoped: 'scoped', unique: 'unique', overload: 'overload',
+  dispatch: 'dispatch', preprocessor: 'preprocessor',
   ambiguous: 'ambiguous', external: 'external', unresolved: 'unresolved'
 };
 const RES_COLOR = {
-  exact: '#74b99a', scoped: '#8fb98a', unique: '#a9b47f',
+  exact: '#74b99a', scoped: '#8fb98a', unique: '#a9b47f', overload: '#b8a86f',
+  dispatch: '#6fa8c8', preprocessor: '#b48fc8',
   ambiguous: '#cfa04f', external: '#8f9fd8', unresolved: '#cf7f6c'
 };
 const KIND_COLOR = {
@@ -258,8 +260,11 @@ async function viewOverview(host) {
           </div>
           <p class="dim" style="font-size:11.5px;line-height:1.6;margin:12px 0 0">
             <b>exact</b> unique qualified match · <b>scoped</b> narrowed by file or directory ·
-            <b>unique</b> single candidate · <b>external</b> builtin or library ·
-            <b>ambiguous</b> several candidates · <b>unresolved</b> no candidate seen.
+            <b>unique</b> single candidate by name · <b>overload</b> one declaration site, several signatures ·
+            <b>dispatch</b> member call on a receiver whose type is not in the index ·
+            <b>preprocessor</b> macro, settled by textual inclusion order ·
+            <b>external</b> builtin or library · <b>ambiguous</b> several different same-named things ·
+            <b>unresolved</b> no candidate seen.
             Name-based resolution trades completeness for needing no compile database.
           </p>
         </div>
@@ -1254,19 +1259,26 @@ async function viewMetrics(host) {
     <div class="rule"></div>
     <h2>Resolution by language</h2>
     <table class="grid" style="margin-top:12px">
-      <thead><tr><th>lang</th><th>references</th><th>resolved</th><th>external</th><th>ambiguous</th><th>unresolved</th></tr></thead>
+      <thead><tr><th>lang</th><th>references</th><th>one def</th><th>one site</th>
+        <th>dispatch</th><th>preproc</th><th>external</th><th>ambiguous</th><th>unresolved</th></tr></thead>
       <tbody>${d.by_lang.map((l) => {
         const pct = (x) => (100 * (x || 0) / (l.refs || 1)).toFixed(1) + '%';
         return `<tr><td class="mono">${esc(l.lang)}</td><td class="mono dim">${n(l.refs)}</td>
-          <td class="mono" style="color:var(--ok)">${pct(l.strong)}</td>
+          <td class="mono" style="color:${RES_COLOR.unique}">${pct(l.onedef)}</td>
+          <td class="mono" style="color:${RES_COLOR.overload}">${pct(l.strong)}</td>
+          <td class="mono" style="color:${RES_COLOR.dispatch}">${pct(l.dispatch)}</td>
+          <td class="mono" style="color:${RES_COLOR.preprocessor}">${pct(l.preprocessor)}</td>
           <td class="mono" style="color:var(--ext)">${pct(l.external)}</td>
           <td class="mono" style="color:var(--amb)">${pct(l.ambiguous)}</td>
           <td class="mono" style="color:var(--bad)">${pct(l.unresolved)}</td></tr>`;
       }).join('')}</tbody>
     </table>
     <p class="dim" style="font-size:11.5px;margin-top:12px">
-      ${n(resTotal)} references total. A low “resolved” share is normal for headers-only trees:
-      the callee is not in the index, so the name cannot bind.
+      ${n(resTotal)} references total. <b>one def</b> is a single definition,
+      <b>one site</b> adds overload sets (the declaration is located, the signature is not).
+      A low share is normal for headers-only trees: the callee is not in the index,
+      so the name cannot bind. <b>dispatch</b> is the opposite failure: the callee is in
+      the tree but the receiver's type is not, and no amount of scope walking finds it.
     </p>
   </div>`;
 }

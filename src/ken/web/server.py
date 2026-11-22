@@ -610,7 +610,11 @@ def api_metrics(con, params):
             "missing": missing, "resolution": resolution,
             "by_lang": _rows(con, """
                 SELECT f.lang, COUNT(*) refs,
-                       SUM(r.resolution IN ('exact','scoped','unique')) strong,
+                       SUM(r.resolution IN ('exact','scoped','unique')) onedef,
+                       SUM(r.resolution IN ('exact','scoped','unique','overload')) strong,
+                       SUM(r.resolution = 'overload') overload,
+                       SUM(r.resolution = 'dispatch') dispatch,
+                       SUM(r.resolution = 'preprocessor') preprocessor,
                        SUM(r.resolution = 'external') external,
                        SUM(r.resolution = 'ambiguous') ambiguous,
                        SUM(r.resolution = 'unresolved') unresolved
